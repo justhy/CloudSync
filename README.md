@@ -64,7 +64,7 @@
 | 包 | 职责 |
 | --- | --- |
 | `cmd/cloudsync` | 入口：装配依赖、信号处理、优雅关闭 |
-| `cmd/rclone-mock` | 假 rclone RC 服务，用于无 rclone 环境下的联调与压测 |
+| `cmd/rclone-mock` | 仅开发用的假 rclone RC 服务（测试替身）；**不参与构建与发版** |
 | `internal/config` | YAML + 环境变量 + 命令行合并，校验与默认值派生 |
 | `internal/logging` | slog 初始化、字段助手、rclone 输出环形缓冲 |
 | `internal/store` | 任务 / 运行记录的 SQLite 持久化 |
@@ -122,32 +122,6 @@ CLOUDSYNC_SERVER_PASSWORD=x ./bin/cloudsync -check
 ```
 
 启动后打开 <http://127.0.0.1:8080/>，用配置中的用户名/密码登录。
-
-### 不装 rclone 先跑通
-
-仓库自带 `cmd/rclone-mock`，可模拟 rclone RC 服务：
-
-```bash
-make build
-./bin/rclone-mock rcd --rc-addr 127.0.0.1:5572 --rc-user admin --rc-pass dev
-# 另开一个终端（config.yaml 在仓库根目录，所以不用传 -config）
-./bin/cloudsync                            # 配置里设 rclone.auto_start: false
-```
-
-mock 支持用环境变量控制模拟行为：
-
-| 变量 | 含义 |
-| --- | --- |
-| `MOCK_DURATION_MS` | 单次传输耗时（默认约 3000ms） |
-| `MOCK_TOTAL_BYTES` | 报告的总字节数 |
-| `MOCK_FAIL` | 非空则本次任务判定为失败 |
-| `MOCK_DELAY_MS` | 提交后到开始传输的延迟 |
-
-mock 只实现少数 RC 端点，对不认识的命令行参数一律忽略。因此也可以直接让
-CloudSync 托管它（`rclone.path` 指向 mock、`rclone.auto_start: true`），
-无需 `auto_start: false` 手工分两步——宿主追加的 `--rc-job-expire-duration`
-这类真实 rclone 参数不会让 mock 启动失败。该行为由
-`cmd/rclone-mock/main_test.go` 的 `TestStripUnknownFlagsSupervisorCommandLine` 守护。
 
 ---
 
@@ -713,7 +687,6 @@ Windows 的 Git Bash 一般不带 `zip`，该目标会**直接报错退出**，�
 ```bash
 make help          # 列出全部目标
 make build         # 构建 bin/cloudsync
-make build-mock    # 构建 bin/rclone-mock
 make web-build     # 构建前端产物（改了 web/src 之后必跑）
 make test          # go test ./...
 make vet           # go vet ./...
@@ -728,7 +701,7 @@ make clean         # 清理 bin/ 与 dist/
 
 ```
 cmd/cloudsync/          入口：装配、信号、优雅关闭
-cmd/rclone-mock/        假 rclone RC 服务（联调 / 压测）
+cmd/rclone-mock/        仅开发用的假 rclone RC 服务（不参与构建 / 发版）
 internal/config/        YAML + env + flag 合并与校验
 internal/logging/       slog 初始化、字段助手、环形缓冲
 internal/store/         任务 / 运行记录持久化
@@ -772,7 +745,7 @@ go test ./internal/web/... -v    # 单包
 
 - `config`、`store`、`rclone`、`scheduler`、`manager` 是**单元测试**，其中 rclone 客户端与 supervisor 用 `httptest` 假服务驱动。
 - `web` 是**集成测试**：起真实的 `httptest` 服务 + 假 rclone RC 服务 + 真实 SQLite，覆盖认证、限流、任务 CRUD、触发、进度、SSE、权限边界。
-- 需要真实 rclone 二进制的场景用 `cmd/rclone-mock` 替代，CI 无需安装 rclone。
+- 上述假 rclone RC 都是**进程内替身**，CI 与单元测试**不依赖真实 rclone**，因此无需在 CI 里安装 rclone。
 
 ---
 

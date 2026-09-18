@@ -23,9 +23,7 @@ COPY . .
 ARG VERSION=dev
 # -trimpath 去掉构建机路径，产出可复现；-s -w 减小体积。
 RUN go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-        -o /out/cloudsync ./cmd/cloudsync \
- && go build -trimpath -ldflags "-s -w" \
-        -o /out/rclone-mock ./cmd/rclone-mock
+        -o /out/cloudsync ./cmd/cloudsync
 
 # ---------------------------------------------------------------------------
 # 运行阶段
@@ -41,7 +39,6 @@ RUN apk add --no-cache rclone ca-certificates tzdata \
  && install -d -o cloudsync -g cloudsync /data /config/rclone
 
 COPY --from=builder /out/cloudsync /usr/local/bin/cloudsync
-COPY --from=builder /out/rclone-mock /usr/local/bin/rclone-mock
 COPY config.example.yaml /etc/cloudsync/config.yaml
 
 # 容器内约定：

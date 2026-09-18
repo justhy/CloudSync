@@ -12,9 +12,7 @@ SHELL      := /bin/sh
 BIN_DIR    := bin
 DIST_DIR   := dist
 APP        := cloudsync
-MOCK       := rclone-mock
 PKG_MAIN   := ./cmd/cloudsync
-PKG_MOCK   := ./cmd/rclone-mock
 
 # 版本号优先取 git tag/commit，取不到则回退 dev。
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -64,15 +62,6 @@ build: ## 构建当前平台的 cloudsync
 	@mkdir -p $(BIN_DIR)
 	$(GO) build $(GOFLAGS) -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(APP) $(PKG_MAIN)
 	@echo "已构建 $(BIN_DIR)/$(APP) ($(VERSION))"
-
-.PHONY: build-mock
-build-mock: ## 构建 rclone-mock（无 rclone 时的联调用假服务）
-	@mkdir -p $(BIN_DIR)
-	$(GO) build $(GOFLAGS) -trimpath -o $(BIN_DIR)/$(MOCK) $(PKG_MOCK)
-	@echo "已构建 $(BIN_DIR)/$(MOCK)"
-
-.PHONY: build-all
-build-all: build build-mock ## 构建全部二进制
 
 .PHONY: cross
 cross: ## 交叉编译全部平台到 dist/（裸二进制，不打包）
@@ -226,10 +215,6 @@ check: fmt-check vet test ## 提交前一键校验
 .PHONY: run
 run: ## 本地运行（读取 config.yaml）
 	$(GO) run $(PKG_MAIN) -config config.yaml -log-format text
-
-.PHONY: run-mock
-run-mock: ## 启动 rclone-mock，供 rclone.auto_start=false 时联调
-	$(GO) run $(PKG_MOCK) rcd --rc-addr 127.0.0.1:5572 --rc-user admin --rc-pass dev
 
 .PHONY: check-config
 check-config: ## 校验 config.yaml
