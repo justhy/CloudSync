@@ -17,6 +17,7 @@
 - [任务类型与参数](#任务类型与参数)
 - [cron 表达式](#cron-表达式)
 - [部署](#部署)
+- [发版](#发版)
 - [开发](#开发)
 - [已知限制](#已知限制)
 
@@ -569,6 +570,84 @@ journalctl -u cloudsync -f
 
 ---
 
+## 发版
+
+发版走 GitHub Actions（`.github/workflows/release.yml`）：推一个 tag 上去，自动
+「校验 → 交叉编译 → 打包 → 建 Release 草稿」。构建参数只有一份 —— 在 Makefile 的
+`dist` 目标里，CI 只负责编排，不会出现 CI 与本地两套参数悄悄漂移的情况。
+
+### 触发方式
+
+**正式发版**，推一个 `v*` tag：
+
+```bash
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+**只试跑不发布**：仓库 Actions 页面选 `release` → Run workflow，填一个版本号
+（默认 `v0.0.0-dev`）。只会产出 Actions artifact 供下载检查，不会建 Release。
+
+### 前置条件
+
+不满足时表现为「什么都没发生」，而且**没有任何报错**，是最容易踩的坑：
+
+1. 仓库已经推到 GitHub，`.github/workflows/release.yml` 已经进了仓库；
+2. tag 触发取的是 **tag 指向的那个提交**里的 workflow 文件 —— 先提交 workflow，
+   再打 tag，顺序反了就永远不会触发；
+3. 手动触发的 Run workflow 按钮只认**默认分支**上的 workflow 文件。
+
+### 产物命名
+
+`cloudsync-<版本>-<系统>-<架构>.<tar.gz|zip>`：
+
+| 平台 | 归档 |
+| --- | --- |
+| Linux amd64 / arm64 | `cloudsync-v0.1.0-linux-amd64.tar.gz` |
+| macOS Intel / Apple Silicon | `cloudsync-v0.1.0-darwin-amd64.tar.gz` |
+| Windows amd64 | `cloudsync-v0.1.0-windows-amd64.zip` |
+
+另附一份 `SHA256SUMS`：
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+归档内含可执行文件 + `README.md` + `config.example.yaml`。Unix 平台刻意用
+`tar.gz` 而不是裸二进制 —— 裸文件下载后会丢掉可执行位，`tar.gz` 能保留。
+
+### Release 是草稿
+
+工作流建的是**草稿** Release（`draft: true`），需要人工过一眼产物与自动生成的
+Release notes，再点 Publish。注意：草稿状态下 `GET /releases/latest` 取不到这份
+Release，别误以为发布失败。
+
+### 本地打包
+
+```bash
+make dist VERSION=v0.1.0    # → dist/*.tar.gz|*.zip 与 SHA256SUMS
+```
+
+`make dist` 依赖 `zip` / `tar` / `sha256sum`，所以适合在 Linux/WSL 或 CI 上跑。
+Windows 的 Git Bash 一般不带 `zip`，该目标会**直接报错退出**，而不是产出一份
+残缺的 `dist/`。另外 Mac 上没有 `sha256sum`，会自动退回 `shasum -a 256`。
+
+### 版本号从哪来
+
+`main.version` 由 `-ldflags -X` 注入，内置回退值是 `dev`：
+
+- CI：用 tag 名（如 `v0.1.0`）；
+- 本地：`git describe --tags --always --dirty` —— 有 tag 就是 `v0.1.0`，没 tag
+  就是 commit 短哈希（如 `5ea7dbb`），工作区脏则带 `-dirty` 后缀。
+
+查当前二进制的版本：
+
+```bash
+./cloudsync -version
+```
+
+---
+
 ## 开发
 
 ```bash
@@ -580,8 +659,9 @@ make test          # go test ./...
 make vet           # go vet ./...
 make fmt           # gofmt -l -w
 make run           # 本地运行（读取 config.yaml）
-make cross         # 交叉编译 linux/amd64、linux/arm64、darwin/arm64、windows/amd64
-make clean         # 清理 bin/
+make cross         # 交叉编译 5 个平台到 dist/（裸二进制）
+make dist          # 交叉编译 + 打包归档 + SHA256SUMS（发版用，见「发版」）
+make clean         # 清理 bin/ 与 dist/
 ```
 
 ### 代码结构
