@@ -26,8 +26,32 @@ GOFLAGS    ?=
 # -s -w 去掉符号表与调试信息；-X 注入版本号。
 LDFLAGS    := -s -w -X main.version=$(VERSION)
 
-# 交叉编译目标。
-PLATFORMS  := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
+# 交叉编译目标。格式：os/arch，第三段可选 —— 只有 32 位 ARM 需要它，即 GOARM。
+#   linux/arm/6 → GOARM=6（armv6，能跑在 v6 与 v7 硬件上，兼容性最好）
+#   linux/arm/7 → GOARM=7（armv7 硬浮点，性能更好，现代 32 位 ARM 用户态的主流）
+# Go 对 GOARCH=arm 的默认 GOARM 是 7，这里两个都出，文件名不歧义。
+#
+# **MIPS 全家出不了二进制**，不要再往下面的清单里加 mips/mipsle/mips64/mips64le：
+# modernc.org/sqlite（纯 Go SQLite 驱动，也是本项目 CGO_ENABLED=0 交叉编译的前提）
+# 依赖 modernc.org/libc，而 libc 没有 MIPS 实现 ——
+#   - mips / mipsle / mips64：errno 等包 "build constraints exclude all Go files"，
+#     即该架构下 libc 一个文件都没有；
+#   - mips64le：libc 有半套，但 sqlite 侧的绑定缺失，报一堆
+#     "undefined: sqlite3_index_constraint / Xsqlite3_config / SQLITE_OK"。
+# 真需要 MIPS 只能换成 CGO 版驱动（mattn/go-sqlite3），那等于放弃无 CGO 交叉编译，
+# 要为每个目标配 C 交叉工具链 —— 代价远大于收益，不建议。
+PLATFORMS  := \
+	linux/amd64 \
+	linux/386 \
+	linux/arm/6 \
+	linux/arm/7 \
+	linux/arm64 \
+	linux/riscv64 \
+	windows/amd64 \
+	windows/386 \
+	windows/arm64 \
+	darwin/amd64 \
+	darwin/arm64
 
 .DEFAULT_GOAL := help
 
@@ -51,67 +75,73 @@ build-mock: ## 构建 rclone-mock（无 rclone 时的联调用假服务）
 build-all: build build-mock ## 构建全部二进制
 
 .PHONY: cross
-cross: ## 交叉编译多平台到 dist/（裸二进制，不打包）
+cross: ## 交叉编译全部平台到 dist/（裸二进制，不打包）
 	@mkdir -p $(DIST_DIR)
 	@set -e; for p in $(PLATFORMS); do \
-		os=$${p%/*}; arch=$${p#*/}; \
-		ext=""; [ "$$os" = "windows" ] && ext=".exe"; \
-		out="$(DIST_DIR)/$(APP)-$$os-$$arch$$ext"; \
-		echo "-> $$out"; \
-		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 \
+		os=$${p%%/*}; rest=$${p#*/}; arch=$${rest%%/*}; variant=""; \
+		if [ "$$rest" != "$$arch" ]; then variant=$${rest#*/}; fi; \
+		ext=""; if [ "$$os" = "windows" ]; then ext=".exe"; fi; \
+		suffix="$$os-$$arch"; \
+		if [ -n "$$variant" ]; then suffix="$${suffix}v$${variant}"; fi; \
+		goarm=""; if [ "$$arch" = "arm" ]; then goarm="$$variant"; fi; \
+		out="$(DIST_DIR)/$(APP)-$(VERSION)-$${suffix}$${ext}"; \
+		echo "-> $${suffix}"; \
+		env GOOS="$$os" GOARCH="$$arch" CGO_ENABLED=0 $${goarm:+GOARM=$$goarm} \
 			$(GO) build $(GOFLAGS) -trimpath -ldflags "$(LDFLAGS)" -o "$$out" $(PKG_MAIN); \
+		chmod 0755 "$$out"; \
 	done
 	@echo "交叉编译完成，产物在 $(DIST_DIR)/"
 
-# 发版打包：交叉编译 → 每平台打成归档 → 生成 SHA256SUMS。CI 走的就是这个目标，
-# 本地和 CI 共用一份编译参数，避免两边悄悄漂移。
+# 发版打包：dist 依赖 cross —— **编译参数只有 cross 一份**，这里只做打包，
+# 所以不可能出现「CI 与本地两套 go build 参数悄悄漂移」。
 #
-# 归档命名：cloudsync-<版本>-<系统>-<架构>.<tar.gz|zip>
+# 归档命名：cloudsync-<版本>-<系统>-<架构>[vN].<tar.gz|zip>
 #   cloudsync-v0.1.0-linux-amd64.tar.gz
+#   cloudsync-v0.1.0-linux-armv7.tar.gz     <- 32 位 ARM 带 vN 后缀
 #   cloudsync-v0.1.0-windows-amd64.zip
-# 归档内含：可执行文件 + README.md + config.example.yaml。
+# 归档内含：cloudsync（可执行文件，Unix 平台带可执行位）+ README.md + config.example.yaml。
 #
-# 为什么 Unix 用 tar.gz 而不是直接丢裸二进制：裸文件下载后会丢掉可执行位，
+# 为什么 Unix 用 tar.gz 而不是直接丢裸二进制：裸文件从 GitHub 下载后会丢掉可执行位，
 # 用户还得自己 chmod +x；tar.gz 能保留。Windows 用 zip，双击就能解压。
 #
-# 所以打包前后要保证二进制带可执行位：go build 在 Linux 上默认 0755，但值受
-# umask 影响，这里显式 chmod 0755 抹平差异。（在 Windows 盘上 chmod 是空操作，
-# 本地打出来的 tar 里会是 0644 —— 属正常现象，CI 在 Linux 上打不会有这问题。）
+# 注意 dist/ 里同时有 cross 产出的**裸二进制**和这里的**归档**，所以下面算校验和时
+# 只 glob *.tar.gz *.zip —— 写成 * 会把裸二进制也算进去。CI 上传 Release 同理只取
+# 归档与 SHA256SUMS，见 .github/workflows/release.yml。
 #
 # 依赖 zip / tar / sha256sum（或 macOS 的 shasum）。CI 的 ubuntu runner 全部自带；
 # Windows 的 Git Bash 通常没有 zip，会在此处直接报错退出，而不是产出一份残缺的
 # dist —— 本地要打包请用 WSL/Linux，或走 workflow_dispatch 试跑。
 .PHONY: dist
-dist: ## 交叉编译并打包发版归档（产出 dist/*.tar.gz|*.zip 与 SHA256SUMS）
+dist: cross ## 交叉编译并打包发版归档（产出 dist/*.tar.gz|*.zip 与 SHA256SUMS）
 	@command -v zip >/dev/null 2>&1 || { \
 		echo "缺少 zip 命令：Windows 的 Git Bash 一般不带 zip。"; \
 		echo "请在 Linux/WSL 或 CI 上执行 make dist，或安装 zip 后重试。"; \
 		exit 1; }
-	@rm -rf $(DIST_DIR)
-	@mkdir -p $(DIST_DIR)
+	@rm -rf $(DIST_DIR)/.stage
+	@rm -f $(DIST_DIR)/*.tar.gz $(DIST_DIR)/*.zip $(DIST_DIR)/SHA256SUMS
 	@set -e; for p in $(PLATFORMS); do \
-		os=$${p%/*}; arch=$${p#*/}; \
-		ext=""; [ "$$os" = "windows" ] && ext=".exe"; \
-		name="$(APP)-$(VERSION)-$$os-$$arch"; \
-		stage="$(DIST_DIR)/.stage/$$name"; \
-		mkdir -p "$$stage"; \
-		echo "-> $$name"; \
-		GOOS=$$os GOARCH=$$arch CGO_ENABLED=0 \
-			$(GO) build $(GOFLAGS) -trimpath -ldflags "$(LDFLAGS)" \
-				-o "$$stage/$(APP)$$ext" $(PKG_MAIN); \
-		chmod 0755 "$$stage/$(APP)$$ext"; \
-		cp README.md config.example.yaml "$$stage/"; \
+		os=$${p%%/*}; rest=$${p#*/}; arch=$${rest%%/*}; variant=""; \
+		if [ "$$rest" != "$$arch" ]; then variant=$${rest#*/}; fi; \
+		ext=""; if [ "$$os" = "windows" ]; then ext=".exe"; fi; \
+		suffix="$$os-$$arch"; \
+		if [ -n "$$variant" ]; then suffix="$${suffix}v$${variant}"; fi; \
+		name="$(APP)-$(VERSION)-$${suffix}"; \
+		stage="$(DIST_DIR)/.stage/$${name}"; \
+		mkdir -p "$${stage}"; \
+		echo "-> $${name}"; \
+		cp "$(DIST_DIR)/$(APP)-$(VERSION)-$${suffix}$${ext}" "$${stage}/$(APP)$${ext}"; \
+		cp README.md config.example.yaml "$${stage}/"; \
 		if [ "$$os" = "windows" ]; then \
-			( cd "$$stage" && zip -qr "../../$$name.zip" "$(APP)$$ext" README.md config.example.yaml ); \
+			( cd "$${stage}" && zip -qr "../../$${name}.zip" "$(APP)$${ext}" README.md config.example.yaml ); \
 		else \
-			tar -C "$$stage" -czf "$(DIST_DIR)/$$name.tar.gz" "$(APP)" README.md config.example.yaml; \
+			tar -C "$${stage}" -czf "$(DIST_DIR)/$${name}.tar.gz" "$(APP)" README.md config.example.yaml; \
 		fi; \
 	done
 	@rm -rf $(DIST_DIR)/.stage
 	@cd $(DIST_DIR) && if command -v sha256sum >/dev/null 2>&1; then \
-		sha256sum * > SHA256SUMS; \
+		sha256sum *.tar.gz *.zip > SHA256SUMS; \
 	else \
-		shasum -a 256 * > SHA256SUMS; \
+		shasum -a 256 *.tar.gz *.zip > SHA256SUMS; \
 	fi
 	@echo "打包完成：$(DIST_DIR)/（版本 $(VERSION)）"
 	@ls -lh $(DIST_DIR)

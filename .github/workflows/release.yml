@@ -83,10 +83,15 @@ jobs:
       - name: 列出产物
         run: ls -lh dist/
 
+      # 只传归档与校验和。dist/ 里还躺着 cross 产出的裸二进制（本地自用），
+      # 写成 dist/* 会把它们一并传上去 —— Release 资产直接翻倍、命名还重复。
       - uses: actions/upload-artifact@v4
         with:
           name: dist
-          path: dist/*
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
           if-no-files-found: error
 
   release:
@@ -103,7 +108,10 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
           # 先出草稿，人工过一眼产物与 Release notes 再点 Publish。
           # 注意：草稿状态下 /releases/latest 取不到，别以为发布失败了。
           draft: true

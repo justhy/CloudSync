@@ -599,22 +599,48 @@ git push origin v0.1.0
 
 ### 产物命名
 
-`cloudsync-<版本>-<系统>-<架构>.<tar.gz|zip>`：
+`cloudsync-<版本>-<系统>-<架构>[vN].<tar.gz|zip>`（32 位 ARM 带 `vN` 区分 GOARM）：
 
-| 平台 | 归档 |
-| --- | --- |
-| Linux amd64 / arm64 | `cloudsync-v0.1.0-linux-amd64.tar.gz` |
-| macOS Intel / Apple Silicon | `cloudsync-v0.1.0-darwin-amd64.tar.gz` |
-| Windows amd64 | `cloudsync-v0.1.0-windows-amd64.zip` |
+| 系统 | 架构 | 归档 |
+| --- | --- | --- |
+| Linux | amd64（64 位 x86） | `cloudsync-v0.1.0-linux-amd64.tar.gz` |
+| Linux | 386（32 位 x86） | `cloudsync-v0.1.0-linux-386.tar.gz` |
+| Linux | armv6（32 位 ARM） | `cloudsync-v0.1.0-linux-armv6.tar.gz` |
+| Linux | armv7（32 位 ARM） | `cloudsync-v0.1.0-linux-armv7.tar.gz` |
+| Linux | arm64（64 位 ARM） | `cloudsync-v0.1.0-linux-arm64.tar.gz` |
+| Linux | riscv64 | `cloudsync-v0.1.0-linux-riscv64.tar.gz` |
+| Windows | amd64（64 位 x86） | `cloudsync-v0.1.0-windows-amd64.zip` |
+| Windows | 386（32 位 x86） | `cloudsync-v0.1.0-windows-386.zip` |
+| Windows | arm64（64 位 ARM） | `cloudsync-v0.1.0-windows-arm64.zip` |
+| macOS | amd64（Intel） | `cloudsync-v0.1.0-darwin-amd64.tar.gz` |
+| macOS | arm64（Apple Silicon） | `cloudsync-v0.1.0-darwin-arm64.tar.gz` |
 
-另附一份 `SHA256SUMS`：
+另附一份 `SHA256SUMS`（只覆盖归档，不含中间产物）：
 
 ```bash
 sha256sum -c SHA256SUMS
 ```
 
-归档内含可执行文件 + `README.md` + `config.example.yaml`。Unix 平台刻意用
-`tar.gz` 而不是裸二进制 —— 裸文件下载后会丢掉可执行位，`tar.gz` 能保留。
+归档内含 `cloudsync`（Unix 平台带可执行位）+ `README.md` + `config.example.yaml`。Unix 平台
+刻意用 `tar.gz` 而不是裸二进制 —— 裸文件从 GitHub 下载后会丢掉可执行位，`tar.gz` 能保留。
+
+32 位 ARM 为什么出两个：`armv6` 能跑在 v6 与 v7 硬件上（兼容性最好），`armv7` 是硬浮点、
+性能更好。两者文件名不歧义，多一个归档而已。
+
+#### 为什么没有 MIPS
+
+`mips` / `mipsle` / `mips64` / `mips64le` **全部编不出来**。不是 Makefile 少配了什么，
+而是 SQLite 驱动不支持：本项目用纯 Go 的 `modernc.org/sqlite`（这正是 `CGO_ENABLED=0`
+能交叉编译的前提），它依赖的 `modernc.org/libc` 没有 MIPS 实现 ——
+
+- `mips` / `mipsle` / `mips64`：libc 在该架构下一个文件都没有，报
+  `build constraints exclude all Go files`；
+- `mips64le`：libc 有半套，但 sqlite 侧绑定缺失，报一堆
+  `undefined: sqlite3_index_constraint` / `Xsqlite3_config` / `SQLITE_OK`。
+
+这两个库的版本是 `modernc.org/sqlite v1.34.5` / `modernc.org/libc v1.55.3`；升级后
+可以再验证一次 MIPS 是否被补上。真需要 MIPS 只能换 CGO 版驱动
+（`mattn/go-sqlite3`），那等于放弃无 CGO 交叉编译、给每个目标配 C 交叉工具链。
 
 ### Release 是草稿
 
@@ -627,6 +653,10 @@ Release，别误以为发布失败。
 ```bash
 make dist VERSION=v0.1.0    # → dist/*.tar.gz|*.zip 与 SHA256SUMS
 ```
+
+`dist` 依赖 `cross`，所以编译参数只有 `cross` 一份，不存在「本地与 CI 两套参数漂移」。
+跑完之后 `dist/` 里**同时有裸二进制和归档**（前者是 `cross` 的产物）—— 上传 Release 时
+只取归档与 `SHA256SUMS`，workflow 里已按 `*.tar.gz` / `*.zip` 明确限定。
 
 `make dist` 依赖 `zip` / `tar` / `sha256sum`，所以适合在 Linux/WSL 或 CI 上跑。
 Windows 的 Git Bash 一般不带 `zip`，该目标会**直接报错退出**，而不是产出一份
@@ -659,8 +689,8 @@ make test          # go test ./...
 make vet           # go vet ./...
 make fmt           # gofmt -l -w
 make run           # 本地运行（读取 config.yaml）
-make cross         # 交叉编译 5 个平台到 dist/（裸二进制）
-make dist          # 交叉编译 + 打包归档 + SHA256SUMS（发版用，见「发版」）
+make cross         # 交叉编译 11 个平台到 dist/（裸二进制，本地自用）
+make dist          # cross + 打包归档 + SHA256SUMS（发版用，见「发版」）
 make clean         # 清理 bin/ 与 dist/
 ```
 
