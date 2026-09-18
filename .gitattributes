@@ -1,0 +1,21 @@
+# 统一换行符：仓库内一律存 LF，避免 Windows 提交把 CRLF 带进脚本/前端文件
+* text=auto eol=lf
+
+# 这些文件在 Linux 上对 CRLF 敏感，强制 LF 而不是依赖本地 core.autocrlf
+*.sh            text eol=lf
+Makefile        text eol=lf
+Dockerfile      text eol=lf
+*.service       text eol=lf
+*.go            text eol=lf
+*.js            text eol=lf
+*.css           text eol=lf
+*.html          text eol=lf
+*.yaml          text eol=lf
+*.yml           text eol=lf
+
+# 二进制不参与换行转换与 diff
+*.png           binary
+*.jpg           binary
+*.ico           binary
+*.exe           binary
+*.db            binary

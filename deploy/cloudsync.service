@@ -1,0 +1,67 @@
+[Unit]
+Description=CloudSync — rclone RC 云端文件同步管理器
+Documentation=https://github.com/your-org/cloudsync
+# 网络就绪后再启动：CloudSync 需要访问远端存储与本地 rclone RC 端口。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudsync
+Group=cloudsync
+
+# 配置文件权限建议 0600（内含管理端密码）。
+# 若不想把密码写进配置文件，可放到 EnvironmentFile 里，例如：
+#   CLOUDSYNC_SERVER_PASSWORD=...
+EnvironmentFile=-/etc/cloudsync/cloudsync.env
+
+ExecStart=/usr/local/bin/cloudsync -config /etc/cloudsync/config.yaml
+
+# 异常退出自动拉起；stop 时不重启。
+Restart=always
+RestartSec=5s
+
+# 关键：KillMode=mixed 先只给主进程发 SIGTERM（让它走 core/quit 优雅关闭 rclone），
+# 超时后再对整个 cgroup 发 SIGKILL。
+# 若用默认的 control-group，systemd 会直接向 rclone 子进程发信号，
+# 绕过程序内的优雅关闭路径。
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+
+# 工作目录：相对路径的 storage.dsn / log.file 都以此为基准。
+WorkingDirectory=/var/lib/cloudsync
+
+# rclone 并发传输时文件描述符消耗较大。
+LimitNOFILE=65536
+
+# --- 加固 ---------------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+
+# 只读挂载 /home，使 rclone 默认配置位置（~/.config/rclone/rclone.conf）仍可读取。
+# 若把 rclone 配置移到 /etc/rclone/rclone.conf，可改为 ProtectHome=yes。
+ProtectHome=read-only
+
+# ProtectSystem=strict 下 / 为只读，这里显式放行需要写入的目录。
+# 请确保 config.yaml 中：
+#   storage.dsn: /var/lib/cloudsync/cloudsync.db
+#   log.file:    /var/log/cloudsync/cloudsync.log
+# 并且已设置 rclone.config_file: /etc/rclone/rclone.conf
+ReadWritePaths=/var/lib/cloudsync /var/log/cloudsync
+
+# 日志同时走 journal（journalctl -u cloudsync）；log.file 为可选的落盘副本。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cloudsync
+
+[Install]
+WantedBy=multi-user.target

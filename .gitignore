@@ -1,0 +1,72 @@
+# ---------- 构建产物 ----------
+bin/
+dist/
+# go build 不指定 -o 时会直接落在仓库根目录，按平台后缀一并忽略
+/cloudsync
+/cloudsync.exe
+/cloudsync-mock
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# ---------- 本地数据（数据库与运行目录） ----------
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# ---------- 本地配置与密钥（可能含明文密码） ----------
+config.yaml
+config.local.yaml
+*.local.yaml
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---------- 日志 ----------
+*.log
+logs/
+
+# ---------- 前端（web/ 是源码，internal/web/static/ 是构建产物） ----------
+# node_modules 与 Vite 缓存不入库
+web/node_modules/
+web/.vite/
+web/.turbo/
+web/tsconfig.tsbuildinfo
+# 注意：internal/web/static/ 下的产物是**故意提交**的 —— 这样不装 Node
+# 也能 `go build` 出完整二进制（前端通过 go:embed 打进 exe）。
+# 改完 web/src 记得跑 `make web-build` 重新生成。
+
+# ---------- 测试与覆盖率 ----------
+coverage.out
+coverage.html
+coverage.txt
+
+# ---------- Go 工作区（本地多模块联调用，不入库） ----------
+go.work
+go.work.sum
+
+# ---------- 编辑器 / IDE ----------
+.idea/
+.vscode/
+.fleet/
+.history/
+*.iml
+*.swp
+*.swo
+
+# ---------- 系统 ----------
+.DS_Store
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# ---------- 本地代理工作区 ----------
+.workbuddy/

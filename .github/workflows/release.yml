@@ -1,0 +1,110 @@
+# 打包与发布：打 v* tag 即自动跑「校验 → 交叉编译 → 归档 → 建 Release 草稿」。
+#
+# 触发方式：
+#   正式发版：git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+#   仅试跑：  Actions 页面点 Run workflow —— 只产出 artifact，不建 Release
+#
+# 两个前提（不满足会"什么都没发生"，而且没有任何报错，极难排查）：
+#   1. 本文件必须已经存在于默认分支，tag 事件与手动触发才能看到它；
+#   2. 打 tag 时，tag 指向的提交里必须已经包含本文件。
+#
+# 构建逻辑全在 Makefile（make dist）里，CI 只负责编排 —— 避免 CI 与本地
+# 各维护一份编译参数，两边悄悄漂移。
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '手动试跑用的版本号（不会创建 Release）'
+        required: false
+        default: 'v0.0.0-dev'
+
+# 建 Release 与上传资产需要写权限。默认的 GITHUB_TOKEN 是只读的，
+# 少了这一句会在上传阶段报 403，而前面的构建全是绿的。
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: 校验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "以下文件未格式化："
+            echo "$out"
+            exit 1
+          fi
+      - run: go vet ./...
+      # 必须在上传构建产物之前跑：TestTimezoneDatabaseIsEmbedded 守着
+      # import _ "time/tzdata"，删了它 -trimpath 会让 Windows 包启动即失败。
+      - run: go test ./... -count=1
+
+  dist:
+    name: 交叉编译与打包
+    needs: check
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 确定版本号
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            v="${GITHUB_REF_NAME}"
+          else
+            v="${{ inputs.version }}"
+            [ -n "$v" ] || v="v0.0.0-dev"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "打包版本：$v"
+
+      # 一条命令产出全部平台的归档与 SHA256SUMS，本地跑 make dist 结果一致。
+      - name: make dist
+        run: make dist VERSION="${{ steps.ver.outputs.version }}"
+
+      - name: 列出产物
+        run: ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: 发布
+    needs: dist
+    # 只有 tag 触发才建 Release；手动试跑只留 artifact 供下载检查。
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          # 先出草稿，人工过一眼产物与 Release notes 再点 Publish。
+          # 注意：草稿状态下 /releases/latest 取不到，别以为发布失败了。
+          draft: true
+          generate_release_notes: true

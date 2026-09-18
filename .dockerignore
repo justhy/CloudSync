@@ -1,0 +1,35 @@
+# 构建产物与本地数据
+bin/
+dist/
+data/
+*.db
+*.db-shm
+*.db-wal
+coverage.out
+coverage.html
+
+# 本地配置副本（可能含明文密码）
+config.yaml
+config.local.yaml
+*.local.yaml
+.env
+.env.*
+*.log
+logs/
+
+# 前端源码与依赖：镜像只需要 internal/web/static/ 里已构建好的产物
+web/node_modules/
+web/.vite/
+
+# 版本控制与编辑器
+.git/
+.gitignore
+.gitattributes
+.idea/
+.vscode/
+.DS_Store
+.workbuddy/
+
+# 文档与部署文件不参与镜像构建
+README.md
+deploy/

@@ -1,0 +1,115 @@
+# CloudSync 配置示例
+#
+# 用法：cloudsync -config config.yaml
+#
+# 优先级（后者覆盖前者）：
+#   内置默认值  ->  本文件  ->  环境变量（CLOUDSYNC_*）  ->  命令行参数
+#
+# 说明：
+#   - 所有“时长”字段都接受 `30s` / `5m` / `1h30m` 这类写法，也可以直接写整数（单位：秒）。
+#   - 本文件使用了严格模式（KnownFields）：写错字段名会直接报错，不会被静默忽略。
+#   - 环境变量为空字符串时视为“未设置”，因此无法用环境变量把某个字段清空。
+
+server:
+  # Web 管理端监听地址。对外暴露时建议配合反向代理并启用 HTTPS。
+  addr: "0.0.0.0:8080"
+  # 反向代理子路径，如 /cloudsync/。留空即根路径。
+  base_path: "/"
+  # 登录用户名。
+  username: "admin"
+  # 登录密码。必填：留空会启动失败，请改用 CLOUDSYNC_SERVER_PASSWORD 注入。
+  password: ""
+  # 会话签名密钥。留空则每次启动随机生成（重启后所有会话失效）。
+  # 多实例/需要会话跨重启保留时请显式设置一个足够随机的值。
+  session_secret: ""
+  # 会话有效期。
+  session_ttl: "12h"
+  read_timeout: "30s"
+  # 写超时。SSE（/api/events）是长连接，设为 0 表示不限制，否则会被截断。
+  write_timeout: 0
+  # 置为 true 时信任 X-Forwarded-For 中的客户端 IP。
+  # 仅在确定前面有可信反向代理时才开启，否则登录限流可被伪造头绕过。
+  trusted_proxy: false
+
+rclone:
+  # rclone 可执行文件路径。可以是绝对路径，也可以是 PATH 中的名字。
+  path: "rclone"
+  # 传给 rclone 的 --config。留空表示使用 rclone 默认配置文件位置。
+  # 生产环境建议显式指定，避免依赖运行用户的 HOME 目录。
+  config_file: ""
+  # rcd 监听地址。程序启动时会拉起 rclone rcd 监听在这里。
+  rc_addr: "127.0.0.1:5572"
+  # rcd 的 RC API 认证凭据。rc_pass 留空会自动生成随机值（仅当 auto_start=true 有意义）。
+  rc_user: "admin"
+  rc_pass: ""
+  # 为 true 时以 --rc-no-auth 启动，不校验 RC 认证。
+  # 仅当 rc_addr 只监听回环地址时可接受。
+  rc_no_auth: false
+  # 追加到 `rclone rcd` 命令行的原始参数。
+  # 例如：["--log-file", "/var/log/rclone.log", "--transfers", "8"]
+  extra_args: []
+  # rcd 就绪后通过 options/set 下发的全局传输参数。
+  # 例如：{transfers: 8, checkers: 16, bwlimit: "10M"}
+  global_options: {}
+  # 启动时自动拉起 rclone rcd。
+  # false 表示只作为已运行 rcd 的客户端（此时程序退出不会关闭它）。
+  auto_start: true
+  # 子进程意外退出时自动重启。
+  auto_restart: true
+  # 自动重启次数上限，超过后进入 failed 状态（可用管理端手动重启）。
+  max_restarts: 5
+  # 重启退避起始间隔，按指数增长。
+  restart_backoff: "2s"
+  # 等待 rcd 就绪的超时。
+  startup_timeout: "30s"
+  # 关闭 rcd 的超时（先 core/quit 优雅退出，超时后强杀）。
+  shutdown_timeout: "15s"
+  # rclone 的 --log-level，取值 DEBUG/INFO/NOTICE/ERROR。
+  log_level: "INFO"
+  # 内存中保留的 rclone 输出行数上限，用于管理端日志查看与单次运行日志切片。
+  journal_size: 2000
+
+storage:
+  # 目前仅支持 sqlite（纯 Go 实现，无需 CGO）。
+  driver: "sqlite"
+  # SQLite 文件路径。":memory:" 表示内存库（仅用于测试）。
+  dsn: "data/cloudsync.db"
+  # 单个任务保留的运行记录条数上限，超出后自动裁剪；<= 0 表示不限制。
+  history_limit: 5000
+  # 运行记录（含其中的 rclone 日志片段）保留时长。支持 "72h"、"7d"、"30d" 等写法；
+  # <= 0 或不填表示不限制。只清理已结束的记录，运行中的永不清。
+  # 这里配的是初始值，界面「设置」页改过之后以界面设置为准。
+  run_retention: "30d"
+  # 后台过期清理的检查间隔，默认 1h，最短 5m。
+  retention_interval: "1h"
+
+scheduler:
+  # 关闭后所有 cron 任务不再触发，但手动触发仍然可用。
+  enabled: true
+  # IANA 时区名，如 "Asia/Shanghai"。留空表示使用系统本地时区。
+  timezone: "Asia/Shanghai"
+  # cron 表达式语法档位，两档严格互斥、不做猜测：
+  #   false -> 5 段：分 时 日 月 周
+  #   true  -> 6 段：秒 分 时 日 月 周
+  # 两档都支持 @every 1h / @daily 这类描述符。
+  # 段数与档位不符时会直接报错并提示如何切换，避免把 "0 0 3 * *"
+  # 静默解释成“每月 3 日 00:00”而不是用户想要的“每天 03:00”。
+  seconds: false
+  # 全局同时运行的任务数上限。
+  max_concurrent_runs: 4
+  # 任务未显式设置 timeout_seconds 时的默认超时；<= 0 表示不限制（默认）。
+  # 默认不限制：大目录首次同步动辄十几小时，被上限砍断会白跑一整轮。
+  # 若担心任务卡死占住并发额度，可改成 "24h" 这类有限值。
+  default_timeout: "0s"
+  # 同一任务上一轮尚未结束时，跳过本次定时触发。
+  skip_overlap: true
+
+log:
+  # debug / info / warn / error
+  level: "info"
+  # json（适合采集）/ text（适合人读）
+  format: "json"
+  # 非空时同时追加写入该文件。
+  file: ""
+  # 是否记录调用位置（文件名:行号），排查问题时有帮助，但日志体积更大。
+  add_source: false
