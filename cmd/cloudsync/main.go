@@ -40,7 +40,7 @@ func main() {
 
 func run() error {
 	var (
-		configPath  = flag.String("config", "", "配置文件路径（YAML）；也可用 CLOUDSYNC_CONFIG 指定")
+		configPath  = flag.String("config", "", "配置文件路径（YAML）；不指定时先看 CLOUDSYNC_CONFIG，再看当前目录的 config.yaml")
 		showVersion = flag.Bool("version", false, "打印版本并退出")
 		checkOnly   = flag.Bool("check", false, "仅校验配置文件后退出")
 		addr        = flag.String("addr", "", "覆盖 Web 监听地址，如 0.0.0.0:8080")
@@ -57,10 +57,10 @@ func run() error {
 		return nil
 	}
 
-	cfgPath := *configPath
-	if cfgPath == "" {
-		cfgPath = os.Getenv(config.EnvPrefix + "_CONFIG")
-	}
+	// 配置文件定位：-config > CLOUDSYNC_CONFIG > 当前目录下的 config.yaml。
+	// 先解析出来，是为了让下面的启动日志与 -check 能报出**真正**用了哪个文件
+	// （否则自动加载了 config.yaml 却显示"未指定"，排查时会误判）。
+	cfgPath := config.ResolvePath(*configPath)
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
@@ -278,16 +278,20 @@ func usage() {
 用法:
   cloudsync [选项]
 
+  不指定 -config 时，按此顺序找配置文件：CLOUDSYNC_CONFIG -> 当前目录下的 config.yaml。
+  都没有则只用内置默认值（+ 环境变量）启动。
+
 选项:
 `)
 	flag.PrintDefaults()
 	fmt.Fprintf(out, `
 示例:
+  cloudsync                                          # 当前目录有 config.yaml 就用它
   cloudsync -config /etc/cloudsync/config.yaml
   CLOUDSYNC_SERVER_PASSWORD=secret cloudsync -addr 127.0.0.1:8080 -log-level debug
 
 常用环境变量:
-  CLOUDSYNC_CONFIG                 配置文件路径
+  CLOUDSYNC_CONFIG                 配置文件路径（优先级高于当前目录的 config.yaml）
   CLOUDSYNC_SERVER_PASSWORD        管理端登录密码（必填，或用配置文件）
   CLOUDSYNC_RCLONE_PATH            rclone 可执行文件路径
   CLOUDSYNC_RCLONE_RC_ADDR         rcd 监听地址，默认 127.0.0.1:5572

@@ -99,18 +99,26 @@ export GOPROXY=https://goproxy.cn,direct
 
 ### 配置并启动
 
+配置文件叫 `config.yaml` 就行 —— **放在程序的工作目录下，直接启动即可，不用传 `-config`**：
+
 ```bash
 cp config.example.yaml config.yaml
 # 至少填写 server.password（或用环境变量注入）
 export CLOUDSYNC_SERVER_PASSWORD='请改成足够强的密码'
 
-./bin/cloudsync -config config.yaml
+./bin/cloudsync
 ```
 
 只校验配置、不启动：
 
 ```bash
-CLOUDSYNC_SERVER_PASSWORD=x ./bin/cloudsync -config config.yaml -check
+CLOUDSYNC_SERVER_PASSWORD=x ./bin/cloudsync -check
+```
+
+想用别的文件名/路径，或者配置文件不在当前目录，再显式指定：
+
+```bash
+./bin/cloudsync -config /etc/cloudsync/config.yaml
 ```
 
 启动后打开 <http://127.0.0.1:8080/>，用配置中的用户名/密码登录。
@@ -122,8 +130,8 @@ CLOUDSYNC_SERVER_PASSWORD=x ./bin/cloudsync -config config.yaml -check
 ```bash
 make build
 ./bin/rclone-mock rcd --rc-addr 127.0.0.1:5572 --rc-user admin --rc-pass dev
-# 另开一个终端
-./bin/cloudsync -config config.yaml        # 配置里设 rclone.auto_start: false
+# 另开一个终端（config.yaml 在仓库根目录，所以不用传 -config）
+./bin/cloudsync                            # 配置里设 rclone.auto_start: false
 ```
 
 mock 支持用环境变量控制模拟行为：
@@ -151,8 +159,22 @@ CloudSync 托管它（`rclone.path` 指向 mock、`rclone.auto_start: true`）�
 内置默认值  ->  YAML 文件  ->  环境变量 (CLOUDSYNC_*)  ->  命令行参数
 ```
 
+**要读哪个 YAML 文件**由下面这条链决定（前面的赢）：
+
+```
+-config <路径>  ->  CLOUDSYNC_CONFIG  ->  当前工作目录下的 config.yaml（存在才用）
+```
+
+三者都没有时不读文件，只用内置默认值 + 环境变量启动。所以最常见的情况——把
+`config.yaml` 和程序放在一起——**不需要传 `-config`**，直接运行即可。
+
+只看**当前工作目录**，不看可执行文件所在目录：从别处启动时悄悄加载 exe 旁边的
+`config.yaml`，"到底读了哪个文件"会比"没找到配置"更难排查。实际用了哪个文件会写进
+启动日志的 `config_file` 字段，`-check` 也会打印出来。
+
 要点：
 
+- **`config.yaml` 存在但读不出来会直接报错**，不会静默降级成默认值；存在但内容非法同样报错。只有"根本没这个文件"才回落默认值。如果 `config.yaml` 是个同名目录，视为不存在。
 - **严格模式**：未知字段会直接报错，拼错字段名不会被静默忽略。
 - **时长字段**：既接受 `"30s"` / `"5m"` / `"1h30m"`，也接受整数（单位秒）；天/周写作 `"30d"` / `"2w"`（标准库只认到 `h`，这里额外补了两个单位）。
 - **必填项**：`server.addr`、`server.username`、`server.password`、`rclone.rc_addr`。
@@ -165,8 +187,8 @@ CloudSync 托管它（`rclone.path` 指向 mock、`rclone.auto_start: true`）�
 
 | 参数 | 说明 |
 | --- | --- |
-| `-config <path>` | 配置文件路径（等价于 `CLOUDSYNC_CONFIG`） |
-| `-check` | 仅校验配置后退出 |
+| `-config <path>` | 配置文件路径；不指定时先看 `CLOUDSYNC_CONFIG`，再看当前目录的 `config.yaml` |
+| `-check` | 仅校验配置后退出（会打印实际使用的配置文件） |
 | `-version` | 打印版本后退出 |
 | `-addr <host:port>` | 覆盖 `server.addr` |
 | `-log-level <lvl>` | 覆盖 `log.level`：`debug`/`info`/`warn`/`error` |
@@ -180,7 +202,7 @@ CloudSync 托管它（`rclone.path` 指向 mock、`rclone.auto_start: true`）�
 
 | 变量 | 对应配置 |
 | --- | --- |
-| `CLOUDSYNC_CONFIG` | 配置文件路径 |
+| `CLOUDSYNC_CONFIG` | 配置文件路径（优先级高于当前目录的 `config.yaml`） |
 | `CLOUDSYNC_SERVER_ADDR` | `server.addr` |
 | `CLOUDSYNC_SERVER_BASE_PATH` | `server.base_path` |
 | `CLOUDSYNC_SERVER_USERNAME` | `server.username` |
@@ -493,6 +515,10 @@ docker run -d --name cloudsync \
 - 配置文件 `/etc/cloudsync/config.yaml`
 - 数据目录 `/data`（SQLite 落在 `/data/cloudsync.db`）
 - rclone 配置挂载到 `/config/rclone/rclone.conf`
+
+镜像的 `CMD` 显式带了 `-config /etc/cloudsync/config.yaml`，所以**容器里不依赖
+"当前目录自动探测"**（容器的工作目录是 `/data`，不是 `/etc/cloudsync`）。想换配置
+就改 `CMD`，或者在 `/data` 下放一个 `config.yaml` 并去掉那个 `-config`。
 - 以非 root 用户 `cloudsync` 运行
 - 已声明 `HEALTHCHECK`，探测 `/api/health`
 
@@ -510,6 +536,10 @@ sudo install -d -o cloudsync -g cloudsync /var/log/cloudsync
 sudo chown cloudsync:cloudsync /etc/cloudsync/config.yaml
 sudo chmod 600 /etc/cloudsync/config.yaml      # 内含管理端密码
 ```
+
+`deploy/cloudsync.service` 的 `ExecStart` 写了 `-config /etc/cloudsync/config.yaml`。
+服务化场景建议**始终显式指定**：`WorkingDirectory` 与配置目录不是一回事，靠自动探测
+会让"改了配置没生效"变成一道谜题。
 
 在 `/etc/cloudsync/config.yaml` 中至少设置：
 

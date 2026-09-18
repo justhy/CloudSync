@@ -159,6 +159,100 @@ log:
 	}
 }
 
+// TestResolvePathPriority 锁定配置文件定位优先级：
+// -config > CLOUDSYNC_CONFIG > 当前目录的 config.yaml > 不读文件。
+func TestResolvePathPriority(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, DefaultFile),
+		[]byte("server:\n  addr: 127.0.0.1:1111\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	envPath := filepath.Join(dir, "fromenv.yaml")
+
+	t.Run("显式 path 原样返回，压过环境变量与默认文件", func(t *testing.T) {
+		t.Setenv(EnvPrefix+"_CONFIG", envPath)
+		t.Chdir(dir)
+		explicit := filepath.Join(dir, "explicit.yaml")
+		if got := ResolvePath(explicit); got != explicit {
+			t.Errorf("ResolvePath(%q) = %q，应原样返回", explicit, got)
+		}
+	})
+
+	t.Run("环境变量压过当前目录的默认文件", func(t *testing.T) {
+		t.Setenv(EnvPrefix+"_CONFIG", envPath)
+		t.Chdir(dir)
+		if got := ResolvePath(""); got != envPath {
+			t.Errorf(`ResolvePath("") = %q，应为 %q`, got, envPath)
+		}
+	})
+
+	t.Run("都没有时用当前目录的 config.yaml", func(t *testing.T) {
+		t.Setenv(EnvPrefix+"_CONFIG", "")
+		t.Chdir(dir)
+		if got := ResolvePath(""); got != DefaultFile {
+			t.Errorf(`ResolvePath("") = %q，应为 %q`, got, DefaultFile)
+		}
+	})
+
+	t.Run("当前目录没有就返回空串（不读文件）", func(t *testing.T) {
+		t.Setenv(EnvPrefix+"_CONFIG", "")
+		t.Chdir(t.TempDir())
+		if got := ResolvePath(""); got != "" {
+			t.Errorf(`ResolvePath("") = %q，应为空串`, got)
+		}
+	})
+
+	t.Run("同名目录不算配置文件", func(t *testing.T) {
+		t.Setenv(EnvPrefix+"_CONFIG", "")
+		d := t.TempDir()
+		if err := os.Mkdir(filepath.Join(d, DefaultFile), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(d)
+		if got := ResolvePath(""); got != "" {
+			t.Errorf(`ResolvePath("") = %q，目录不该被当成配置文件`, got)
+		}
+	})
+}
+
+// TestLoadAutoDiscoversCwdConfig 是上面那条规则真正生效的端到端防线：
+// 完全不传路径，配置必须来自当前目录的 config.yaml。
+func TestLoadAutoDiscoversCwdConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, DefaultFile),
+		[]byte("server:\n  addr: 127.0.0.1:12345\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvPrefix+"_CONFIG", "")
+	// server.password 是必填项（Validate 会拒），与本次改动无关，这里显式给一个。
+	t.Setenv(EnvPrefix+"_SERVER_PASSWORD", "testpw")
+	t.Chdir(dir)
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\") 失败: %v", err)
+	}
+	if cfg.Server.Addr != "127.0.0.1:12345" {
+		t.Errorf("没有自动加载当前目录的 config.yaml，addr = %q", cfg.Server.Addr)
+	}
+}
+
+// TestLoadWithoutAnyFileUsesDefaults 确保新增的自动探测没有破坏
+// "什么都没有就用内置默认值" 这条既有行为。
+func TestLoadWithoutAnyFileUsesDefaults(t *testing.T) {
+	t.Setenv(EnvPrefix+"_CONFIG", "")
+	t.Setenv(EnvPrefix+"_SERVER_PASSWORD", "testpw")
+	t.Chdir(t.TempDir()) // 空目录，没有 config.yaml
+
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\") 失败: %v", err)
+	}
+	if want := Default().Server.Addr; cfg.Server.Addr != want {
+		t.Errorf("无配置文件时应回落内置默认值，addr = %q，期望 %q", cfg.Server.Addr, want)
+	}
+}
+
 func TestLoadRejectsUnknownField(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.yaml")

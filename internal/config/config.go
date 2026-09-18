@@ -3,6 +3,10 @@
 // 配置来源优先级（后者覆盖前者）：
 //
 //	内置默认值 -> YAML 配置文件 -> 环境变量 (CLOUDSYNC_*) -> 命令行参数
+//
+// 其中"YAML 配置文件"自己要读哪个文件，由 ResolvePath 决定（后者覆盖前者）：
+//
+//	-config 参数 -> CLOUDSYNC_CONFIG 环境变量 -> 当前目录下的 config.yaml（存在才用）
 package config
 
 import (
@@ -33,6 +37,9 @@ import (
 
 // EnvPrefix 是所有环境变量的前缀。
 const EnvPrefix = "CLOUDSYNC"
+
+// DefaultFile 是未显式指定配置文件时自动探测的文件名，相对当前工作目录。
+const DefaultFile = "config.yaml"
 
 // 保留策略的取值范围。
 const (
@@ -274,29 +281,47 @@ func Default() *Config {
 	}
 }
 
-// Load 读取配置文件（path 可为空）、应用环境变量并完成校验。
+// ResolvePath 按优先级选出实际要读取的配置文件路径，空串表示"不读文件"
+// （此时配置完全来自内置默认值 + 环境变量）。
+//
+//  1. 显式传入的 path（-config 参数，或调用方直接给的路径）
+//  2. 环境变量 CLOUDSYNC_CONFIG
+//  3. 当前工作目录下的 config.yaml —— 存在才用
+//
+// 故意只看**当前工作目录**，不看可执行文件所在目录：从别处启动时悄悄加载
+// exe 旁边的 config.yaml，"到底读了哪个文件"会比"没找到配置"更难排查。
+// 启动日志的 config_file 字段会写明最终用了哪个文件。
+func ResolvePath(path string) string {
+	if path != "" {
+		return path
+	}
+	if env := os.Getenv(EnvPrefix + "_CONFIG"); env != "" {
+		return env
+	}
+	// 存在才用。是目录、或探测本身失败（如无权访问当前目录）都当"没有"，
+	// 不额外制造一个"起不来"的失败模式；但文件存在却读不出来时，
+	// 下面 Load 里的 os.ReadFile 会明确报错，不会静默降级成默认值。
+	if fi, err := os.Stat(DefaultFile); err == nil && fi.Mode().IsRegular() {
+		return DefaultFile
+	}
+	return ""
+}
+
+// Load 读取配置文件、应用环境变量并完成校验。
+//
+// path 为 -config 的取值，可为空 —— 为空时按 ResolvePath 的优先级定位文件。
 func Load(path string) (*Config, error) {
 	cfg := Default()
 
-	if path != "" {
-		raw, err := os.ReadFile(path)
+	if resolved := ResolvePath(path); resolved != "" {
+		raw, err := os.ReadFile(resolved)
 		if err != nil {
-			return nil, fmt.Errorf("读取配置文件 %s: %w", path, err)
+			return nil, fmt.Errorf("读取配置文件 %s: %w", resolved, err)
 		}
 		dec := yaml.NewDecoder(strings.NewReader(string(raw)))
 		dec.KnownFields(true)
 		if err := dec.Decode(cfg); err != nil && !errors.Is(err, os.ErrClosed) {
-			return nil, fmt.Errorf("解析配置文件 %s: %w", path, err)
-		}
-	} else if env := os.Getenv(EnvPrefix + "_CONFIG"); env != "" {
-		raw, err := os.ReadFile(env)
-		if err != nil {
-			return nil, fmt.Errorf("读取配置文件 %s: %w", env, err)
-		}
-		dec := yaml.NewDecoder(strings.NewReader(string(raw)))
-		dec.KnownFields(true)
-		if err := dec.Decode(cfg); err != nil {
-			return nil, fmt.Errorf("解析配置文件 %s: %w", env, err)
+			return nil, fmt.Errorf("解析配置文件 %s: %w", resolved, err)
 		}
 	}
 
