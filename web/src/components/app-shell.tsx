@@ -119,7 +119,7 @@ export function AppShell({
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold">CloudSync</div>
           <div className="truncate text-xs text-muted-foreground">
-            {version ? `v${version}` : "rclone 管理台"}
+            {version ? `v${version.replace(/^v/i, "")}` : "rclone 管理台"}
           </div>
         </div>
       </div>
