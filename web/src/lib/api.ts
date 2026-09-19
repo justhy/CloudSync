@@ -1,5 +1,7 @@
 import type {
   ActiveRun,
+  CleanupOptions,
+  CleanupResult,
   Overview,
   Run,
   RunStatus,
@@ -118,6 +120,9 @@ export const api = {
   settings: () => request<SettingsInfo>("api/settings"),
   updateSettings: (retention_hours: number) =>
     request<SettingsInfo>("api/settings", { method: "PUT", body: { retention_hours } }),
+  /** 数据库瘦身：丢弃日志片段 / 裁剪记录 / 清孤儿 / 整理数据库文件。 */
+  cleanupDatabase: (opt: CleanupOptions) =>
+    request<CleanupResult>("api/maintenance/cleanup", { method: "POST", body: opt }),
 
   rclone: () =>
     request<{
@@ -135,6 +140,9 @@ export const api = {
   rcloneRestart: () => request<{ ok: boolean }>("api/rclone/restart", { method: "POST" }),
   rcloneRemotes: () => request<{ remotes: string[] }>("api/rclone/remotes"),
   rcloneLog: (tail = 400) => request<{ lines: string[] }>(`api/rclone/log?tail=${tail}`),
+  /** 清空内存里的 rclone 输出缓冲（不影响任何运行记录）。 */
+  rcloneLogClear: () =>
+    request<{ ok: boolean; cleared: number }>("api/rclone/log/clear", { method: "POST", body: {} }),
 }
 
 /** SSE 事件名。 */

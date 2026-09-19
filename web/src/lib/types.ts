@@ -160,6 +160,10 @@ export interface RcloneStatus {
   auto_restart: boolean
   journal_lines: number
   external: boolean
+  /** 接管：RC 地址上本来就有 rclone rcd（不是本程序拉起的），本程序接管了它。 */
+  adopted: boolean
+  /** 托管相关的一句话说明（例如接管了既有实例），无特殊情况时为空。 */
+  notice?: string
 }
 
 export interface Overview {
@@ -203,6 +207,32 @@ export interface TaskPayload {
   extra_flags: Record<string, unknown>
 }
 
+/** 数据库占用构成（设置页的「数据库瘦身」面板）。 */
+export interface DBStats {
+  main_bytes: number
+  wal_bytes: number
+  shm_bytes: number
+  total_bytes: number
+  /** VACUUM 大致能释放的空间（当前空闲页）。 */
+  reclaimable_bytes: number
+  page_size: number
+  free_pages: number
+  tasks: number
+  runs: number
+  terminal_runs: number
+  /** pending/running 的记录数：整理数据库前必须为 0。 */
+  active_runs: number
+  /** 全部日志片段占用；success_* 是其中属于成功记录的部分。 */
+  log_tail_bytes: number
+  log_tail_runs: number
+  success_log_runs: number
+  success_log_bytes: number
+  orphan_steps: number
+  orphan_runs: number
+  oldest_run_at?: string
+  newest_run_at?: string
+}
+
 /** 设置页：运行记录保留策略与占用情况。 */
 export interface SettingsInfo {
   /** 保留时长（小时）；0 表示不限制。 */
@@ -219,4 +249,37 @@ export interface SettingsInfo {
     oldest_run_at?: string
     db_size_bytes: number
   }
+  db: DBStats
+  /** 配置文件里的每任务记录条数上限，作为瘦身面板的默认值。 */
+  history_limit: number
+}
+
+/** 一次数据库瘦身要做什么。 */
+export interface CleanupOptions {
+  /** 丢弃成功记录的日志片段（失败/取消的留着排查）。 */
+  drop_success_log_tail: boolean
+  /** 丢弃全部记录的日志片段（与上一项同时为真时以本项为准）。 */
+  drop_all_log_tail: boolean
+  /** > 0 时每个任务只保留最近这么多条运行记录。 */
+  retain_per_task: number
+  /** 清理指向已不存在任务的步骤定义与运行记录。 */
+  clean_orphans: boolean
+  /** 截断 WAL + VACUUM，把空间真正还给系统。 */
+  reclaim: boolean
+}
+
+/** 数据库瘦身的结果与前后对比。 */
+export interface CleanupResult {
+  before: DBStats
+  after: DBStats
+  logs_cleared: number
+  runs_pruned: number
+  orphan_steps_cleared: number
+  orphan_runs_cleared: number
+  wal_truncated: boolean
+  vacuumed: boolean
+  /** 非空说明"整理磁盘"这一步被跳过及原因。 */
+  reclaim_skipped?: string
+  reclaimed_bytes: number
+  duration_ms: number
 }

@@ -19,6 +19,7 @@ import (
 
 	"cloudsync/internal/config"
 	"cloudsync/internal/logging"
+	"cloudsync/internal/maintenance"
 	"cloudsync/internal/manager"
 	"cloudsync/internal/rclone"
 	"cloudsync/internal/retention"
@@ -178,7 +179,9 @@ func newTestEnvWith(t *testing.T, mutate func(*config.Config), mutateRC func(*st
 	// 保留策略服务：默认不限，需要验证清理的用例自行改写设置。
 	ret := retention.New(st, cfg.Storage.RunRetention.D(), cfg.Storage.RetentionInterval.D(), logging.Discard())
 
-	s := New(cfg, st, mgr, sch, sup, ret, logging.Discard())
+	maint := maintenance.New(st, mgr.ActiveCount, logging.Discard())
+
+	s := New(cfg, st, mgr, sch, sup, ret, maint, logging.Discard())
 	httpSrv := httptest.NewServer(s.Handler())
 	t.Cleanup(httpSrv.Close)
 
@@ -1472,4 +1475,121 @@ func createTaskViaAPI(t *testing.T, e *testEnv, name string) int64 {
 		t.Fatalf("创建任务应 201，得到 %d", code)
 	}
 	return created.Task.ID
+}
+
+// ---------------------------------------------------------------------------
+// rclone 输出日志：清空
+// ---------------------------------------------------------------------------
+
+func TestRcloneLogClear(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.login()
+
+	// 直接往环形缓冲写一行，等价于子进程输出的效果。
+	_, _ = e.sup.Journal().Write([]byte("2026/09/19 22:30:01 INFO  : 一些 rclone 输出\n"))
+
+	var logOut struct {
+		Lines []string `json:"lines"`
+		Total int      `json:"total"`
+	}
+	if code := e.doJSON("GET", "/api/rclone/log?tail=50", nil, &logOut); code != http.StatusOK || logOut.Total == 0 {
+		t.Fatalf("清空前应能看到日志: code=%d total=%d", code, logOut.Total)
+	}
+
+	var cleared struct {
+		OK      bool  `json:"ok"`
+		Cleared int64 `json:"cleared"`
+	}
+	if code := e.doJSON("POST", "/api/rclone/log/clear", map[string]any{}, &cleared); code != http.StatusOK {
+		t.Fatalf("清空日志应 200，得到 %d", code)
+	}
+	if !cleared.OK || cleared.Cleared == 0 {
+		t.Fatalf("应回报清掉的行数: %+v", cleared)
+	}
+
+	if code := e.doJSON("GET", "/api/rclone/log?tail=50", nil, &logOut); code != http.StatusOK {
+		t.Fatalf("清空后读取日志应 200，得到 %d", code)
+	}
+	if logOut.Total != 0 || len(logOut.Lines) != 0 {
+		t.Fatalf("清空后应为空: total=%d lines=%v", logOut.Total, logOut.Lines)
+	}
+	// 已经是空的时候再点一次不应报错。
+	if code := e.doJSON("POST", "/api/rclone/log/clear", map[string]any{}, &cleared); code != http.StatusOK {
+		t.Fatalf("重复清空应 200，得到 %d", code)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 数据库瘦身
+// ---------------------------------------------------------------------------
+
+func TestDatabaseCleanupEndpoint(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.login()
+	ctx := context.Background()
+
+	task := &store.Task{
+		Name: "瘦身用例", Kind: store.KindSync,
+		Source: "gdrive:a", Dest: "/mnt/b", Enabled: true,
+	}
+	if err := e.store.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	run := &store.Run{
+		TaskID: task.ID, TaskName: task.Name, Kind: task.Kind,
+		Status: store.StatusSuccess, StartedAt: time.Now().UTC(),
+		LogTail: []string{"第一行", "第二行"},
+	}
+	if err := e.store.CreateRun(ctx, run); err != nil {
+		t.Fatal(err)
+	}
+
+	// 什么都不选必须报错：否则用户点了"瘦身"什么也没发生，只会以为是 bug。
+	resp, body := e.do("POST", "/api/maintenance/cleanup", map[string]any{})
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("空选项应 400，得到 %d（%s）", resp.StatusCode, body)
+	}
+
+	var res struct {
+		LogsCleared    int64         `json:"logs_cleared"`
+		Vacuumed       bool          `json:"vacuumed"`
+		WalTruncated   bool          `json:"wal_truncated"`
+		ReclaimedBytes int64         `json:"reclaimed_bytes"`
+		Before         store.DBStats `json:"before"`
+		After          store.DBStats `json:"after"`
+		ReclaimSkipped string        `json:"reclaim_skipped"`
+	}
+	code := e.doJSON("POST", "/api/maintenance/cleanup", map[string]any{
+		"drop_success_log_tail": true,
+		"reclaim":               true,
+	}, &res)
+	if code != http.StatusOK {
+		t.Fatalf("瘦身应 200，得到 %d", code)
+	}
+	if res.LogsCleared != 1 {
+		t.Fatalf("应清掉 1 条成功记录的日志片段，实际 %d", res.LogsCleared)
+	}
+	if !res.Vacuumed || !res.WalTruncated {
+		t.Fatalf("没有任务运行时应整理数据库: %+v", res)
+	}
+	if res.ReclaimSkipped != "" {
+		t.Fatalf("不该被跳过: %s", res.ReclaimSkipped)
+	}
+	if res.After.LogTailBytes != 0 {
+		t.Fatalf("日志片段应清空，实际 %d", res.After.LogTailBytes)
+	}
+
+	// 设置页要能给出占用明细（瘦身面板据此告诉用户空间花在哪里）。
+	var settings struct {
+		DB store.DBStats `json:"db"`
+	}
+	if code := e.doJSON("GET", "/api/settings", nil, &settings); code != http.StatusOK {
+		t.Fatalf("读取设置应 200，得到 %d", code)
+	}
+	if settings.DB.Runs != 1 {
+		t.Fatalf("设置里的数据库统计应包含运行记录数，实际 %+v", settings.DB)
+	}
+	if settings.DB.TotalBytes <= 0 {
+		t.Fatalf("应统计出数据库总占用，实际 %+v", settings.DB)
+	}
 }

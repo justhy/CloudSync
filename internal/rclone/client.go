@@ -131,6 +131,21 @@ func NewClient(cfg config.RcloneConfig, logger *slog.Logger) *Client {
 // Endpoint 返回 RC API 的基地址，便于日志展示。
 func (c *Client) Endpoint() string { return c.base.String() }
 
+// CloseIdleConnections 关闭本客户端持有的空闲 keep-alive 连接。
+//
+// 用途是"让本进程手上不再留有指向已退出实例的连接"：留着的话，之后的 Ping/探测
+// 会打到死连接上，把"实例已退出"误判成"还在应答"。
+//
+// 注意：这里**不是**为了躲 TIME_WAIT。实测（Windows，真实 rclone）TIME_WAIT
+// **不会**阻止同一地址重新 bind——`netstat` 里确实会出现 pid=0 的 TIME_WAIT 条目，
+// 但紧接着 `net.Listen` 同一地址照样成功。真正让 bind 失败的只有一个活着占着
+// 地址的 socket，所以FIN 的先后顺序不必在这里纠结。
+func (c *Client) CloseIdleConnections() {
+	if c.hc != nil {
+		c.hc.CloseIdleConnections()
+	}
+}
+
 // Call 调用一个 RC 方法，params 会被编码为 JSON 请求体，响应解析到 out。
 // out 为 nil 时忽略响应体。params 为 nil 时发送空对象。
 func (c *Client) Call(ctx context.Context, method string, params map[string]any, out any) error {

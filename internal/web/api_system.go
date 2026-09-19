@@ -133,6 +133,21 @@ func (s *Server) handleRcloneLog(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleRcloneLogClear 清空 rclone 输出缓冲。
+//
+// 只清内存里的环形缓冲，不碰库里的运行记录，因此任何时候调用都是安全的。
+// 副作用只有一个：正在进行中的任务，其日志片段会从清空那一刻开始（详情页会
+// 因为 overflow 而提示"日志缓冲已滚动"），这是"清空"本身该有的语义。
+func (s *Server) handleRcloneLogClear(w http.ResponseWriter, r *http.Request) {
+	cleared := s.rclone.Journal().Len()
+	s.rclone.Journal().Reset()
+	s.logger.Info("已清空 rclone 输出缓冲", "cleared", cleared)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"cleared": cleared,
+	})
+}
+
 // handleBrowse 列出远端目录，便于在 UI 中选择源/目标路径。
 func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	fsName := strings.TrimSpace(r.URL.Query().Get("fs"))

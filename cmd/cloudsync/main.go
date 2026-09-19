@@ -20,6 +20,7 @@ import (
 
 	"cloudsync/internal/config"
 	"cloudsync/internal/logging"
+	"cloudsync/internal/maintenance"
 	"cloudsync/internal/manager"
 	"cloudsync/internal/rclone"
 	"cloudsync/internal/retention"
@@ -190,6 +191,12 @@ func run() error {
 	)
 	go ret.Run(rootCtx)
 
+	// 3.6) 数据库瘦身（丢弃日志片段、裁剪记录、整理文件）
+	//
+	// busy 回调用来避开"有任务在运行时整理数据库"：VACUUM 要重写整个库，
+	// 而本程序只用一条数据库连接，期间所有进度回写都会被堵住。
+	maint := maintenance.New(st, mgr.ActiveCount, logger)
+
 	// 4) 调度器
 	sch, err := scheduler.New(cfg.Scheduler, st, mgr, logger)
 	if err != nil {
@@ -205,7 +212,7 @@ func run() error {
 	}
 
 	// 5) Web 管理端
-	srv := web.New(cfg, st, mgr, sch, sup, ret, logger)
+	srv := web.New(cfg, st, mgr, sch, sup, ret, maint, logger)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.ListenAndServe() }()
 	go srv.StartGC(rootCtx)

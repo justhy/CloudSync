@@ -112,6 +112,12 @@ func (s *Server) settingsPayload(r *http.Request) (map[string]any, error) {
 		s.logger.Warn("统计运行记录占用失败", "err", err.Error())
 	}
 
+	// 数据库占用构成：设置页的「数据库瘦身」面板要用它告诉用户空间到底花在哪。
+	db, err := s.store.DatabaseStats(r.Context())
+	if err != nil {
+		s.logger.Warn("统计数据库占用失败", "err", err.Error())
+	}
+
 	interval := ""
 	if s.retention != nil {
 		interval = s.retention.Interval().String()
@@ -124,6 +130,10 @@ func (s *Server) settingsPayload(r *http.Request) (map[string]any, error) {
 		"retention_source":  source,
 		"pending":           pending,
 		"storage":           usage,
-		"interval":          interval,
+		"db":                db,
+		// 每个任务的记录条数上限目前只在配置文件里（storage.history_limit），
+		// 这里把它带出去给瘦身面板当默认值用。
+		"history_limit": s.cfg.Storage.HistoryLimit,
+		"interval":      interval,
 	}, nil
 }

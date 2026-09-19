@@ -63,6 +63,18 @@ type Store interface {
 	// Vacuum 回收空闲页（删除大量记录后数据库文件不会自动变小）。
 	Vacuum(ctx context.Context) error
 
+	// DatabaseStats 返回数据库的占用构成，供「数据库瘦身」面板展示。
+	DatabaseStats(ctx context.Context) (DBStats, error)
+	// ClearRunLogTail 清空运行记录里的 rclone 日志片段；onlySuccess 为 true 时
+	// 只清成功记录（失败记录的日志留着排查）。
+	ClearRunLogTail(ctx context.Context, onlySuccess bool) (int64, error)
+	// DeleteOrphanSteps 删除指向已不存在任务的步骤定义。
+	DeleteOrphanSteps(ctx context.Context) (int64, error)
+	// DeleteOrphanRuns 删除指向已不存在任务的运行记录。
+	DeleteOrphanRuns(ctx context.Context) (int64, error)
+	// CheckpointWAL 把 WAL 回写主库并截断 WAL 文件。
+	CheckpointWAL(ctx context.Context) error
+
 	// GetSetting 读取运行期设置；ok 为 false 表示未设置过。
 	GetSetting(ctx context.Context, key string) (string, bool, error)
 	// SetSetting 写入（upsert）运行期设置。
@@ -85,6 +97,43 @@ type RunStorage struct {
 	OldestRunAt *time.Time `json:"oldest_run_at,omitempty"`
 	// DBSizeBytes 是数据库文件（不含 -wal）当前大小。
 	DBSizeBytes int64 `json:"db_size_bytes"`
+}
+
+// DBStats 描述数据库的占用构成，供「数据库瘦身」面板展示。
+//
+// 之所以要拆得这么细：运行记录的日志片段（log_tail）通常是整个库里最大的
+// 一块占用，而用户看到的"数据库占用"如果只算主文件，就会出现"清了几千条
+// 记录文件却没变小"的错觉（删行只标记空闲页，空间要 VACUUM 才回来）。
+type DBStats struct {
+	// MainBytes 是主库文件大小；WalBytes/ShmBytes 是 -wal / -shm 文件大小。
+	MainBytes  int64 `json:"main_bytes"`
+	WalBytes   int64 `json:"wal_bytes"`
+	ShmBytes   int64 `json:"shm_bytes"`
+	TotalBytes int64 `json:"total_bytes"`
+	// ReclaimableBytes 是空闲页占用的空间，即 VACUUM 大概能释放多少。
+	ReclaimableBytes int64 `json:"reclaimable_bytes"`
+	PageSize         int64 `json:"page_size"`
+	FreePages        int64 `json:"free_pages"`
+
+	Tasks        int64 `json:"tasks"`
+	Runs         int64 `json:"runs"`
+	TerminalRuns int64 `json:"terminal_runs"`
+	// ActiveRuns 是 pending/running 的记录数：整理数据库前要确认它为 0。
+	ActiveRuns int64 `json:"active_runs"`
+
+	// LogTailBytes 是全部日志片段占用的字节数；SuccessLogBytes 是其中属于
+	// 成功记录的部分（这部分清理收益最大、代价最小）。
+	LogTailBytes    int64 `json:"log_tail_bytes"`
+	LogTailRuns     int64 `json:"log_tail_runs"`
+	SuccessLogRuns  int64 `json:"success_log_runs"`
+	SuccessLogBytes int64 `json:"success_log_bytes"`
+
+	// OrphanSteps/OrphanRuns 是任务已删除但残留的步骤定义与运行记录。
+	OrphanSteps int64 `json:"orphan_steps"`
+	OrphanRuns  int64 `json:"orphan_runs"`
+
+	OldestRunAt *time.Time `json:"oldest_run_at,omitempty"`
+	NewestRunAt *time.Time `json:"newest_run_at,omitempty"`
 }
 
 // SQLiteStore 是基于 SQLite 的实现。
@@ -810,6 +859,9 @@ func (s *SQLiteStore) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int, e
 		if err != nil {
 			return nil, 0, err
 		}
+		// 列表不返回日志片段：一条最多 200 行文本，500 条就是几十 MB，
+		// 既拖慢列表接口也让"数据库瘦身"的效果无法体现。详情页用 GetRun 取全文。
+		r.LogTail = nil
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -986,6 +1038,126 @@ func (s *SQLiteStore) resetRunSequenceIfEmpty(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM sqlite_sequence WHERE name = 'runs'`); err != nil {
 		return fmt.Errorf("重置运行记录编号: %w", err)
+	}
+	return nil
+}
+
+// DatabaseStats 返回数据库的占用构成。
+//
+// 所有统计都走子查询一次取回：这些东西是同一个面板上的同一份快照，
+// 分多次查会让数字之间互相矛盾（例如清了日志片段却仍报旧的占用）。
+func (s *SQLiteStore) DatabaseStats(ctx context.Context) (DBStats, error) {
+	var st DBStats
+	var oldest, newest sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT
+			(SELECT COUNT(*) FROM tasks),
+			(SELECT COUNT(*) FROM runs),
+			(SELECT COUNT(*) FROM runs WHERE status IN ('success','failed','canceled')),
+			(SELECT COUNT(*) FROM runs WHERE status IN ('pending','running')),
+			(SELECT COALESCE(SUM(LENGTH(CAST(log_tail AS BLOB))), 0) FROM runs WHERE log_tail <> ''),
+			(SELECT COUNT(*) FROM runs WHERE log_tail <> ''),
+			(SELECT COUNT(*) FROM runs WHERE log_tail <> '' AND status = 'success'),
+			(SELECT COALESCE(SUM(LENGTH(CAST(log_tail AS BLOB))), 0) FROM runs WHERE log_tail <> '' AND status = 'success'),
+			(SELECT COUNT(*) FROM task_steps WHERE task_id NOT IN (SELECT id FROM tasks)),
+			(SELECT COUNT(*) FROM runs WHERE task_id NOT IN (SELECT id FROM tasks)),
+			(SELECT MIN(started_at) FROM runs),
+			(SELECT MAX(started_at) FROM runs)`,
+	).Scan(
+		&st.Tasks, &st.Runs, &st.TerminalRuns, &st.ActiveRuns,
+		&st.LogTailBytes, &st.LogTailRuns, &st.SuccessLogRuns, &st.SuccessLogBytes,
+		&st.OrphanSteps, &st.OrphanRuns, &oldest, &newest,
+	)
+	if err != nil {
+		return DBStats{}, fmt.Errorf("统计数据库占用: %w", err)
+	}
+	st.OldestRunAt = timeFromNull(oldest)
+	st.NewestRunAt = timeFromNull(newest)
+
+	// LENGTH() 对 TEXT 返回字符数，中文一个字 3 字节；这里要的是真实占用，
+	// 所以统一 CAST 成 BLOB 量字节数。
+	if err := s.db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&st.PageSize); err != nil {
+		return DBStats{}, fmt.Errorf("读取页大小: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&st.FreePages); err != nil {
+		return DBStats{}, fmt.Errorf("读取空闲页数: %w", err)
+	}
+	st.ReclaimableBytes = st.PageSize * st.FreePages
+
+	s.fillFileSizes(&st)
+	return st, nil
+}
+
+// fillFileSizes 统计主库与 WAL/SHM 文件大小。
+//
+// 只报主文件会严重低估占用：WAL 里可能还躺着大量未回写的页面，
+// 用户看到"才 2MB"却死活瘦不下来，只会认为功能没生效。
+func (s *SQLiteStore) fillFileSizes(st *DBStats) {
+	st.MainBytes = dbFileSize(s.path)
+	st.WalBytes = dbFileSize(s.path + "-wal")
+	st.ShmBytes = dbFileSize(s.path + "-shm")
+	st.TotalBytes = st.MainBytes + st.WalBytes + st.ShmBytes
+}
+
+// ClearRunLogTail 清空运行记录里的 rclone 日志片段，返回受影响条数。
+//
+// 日志片段（每条最多 200 行）通常是整个库最大的一块占用；onlySuccess 为 true
+// 时只清成功记录——成功任务的日志几乎没人回看，而失败/取消的日志有排查价值。
+func (s *SQLiteStore) ClearRunLogTail(ctx context.Context, onlySuccess bool) (int64, error) {
+	q := `UPDATE runs SET log_tail = '' WHERE log_tail <> ''`
+	if onlySuccess {
+		q += ` AND status = 'success'`
+	}
+	res, err := s.db.ExecContext(ctx, q)
+	if err != nil {
+		return 0, fmt.Errorf("清理运行日志片段: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// DeleteOrphanSteps 删除指向已不存在任务的步骤定义。
+//
+// DeleteTask 会在同一个事务里删干净三张表，正常不会留下孤儿；这里是给
+// 手工改库、旧版本残留等情况兜底，所以永远只是"顺手清一下"。
+func (s *SQLiteStore) DeleteOrphanSteps(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM task_steps WHERE task_id NOT IN (SELECT id FROM tasks)`)
+	if err != nil {
+		return 0, fmt.Errorf("清理孤儿步骤: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// DeleteOrphanRuns 删除指向已不存在任务的运行记录。
+//
+// 这些记录在按任务筛选时永远看不到，却照样占着日志片段的空间。
+func (s *SQLiteStore) DeleteOrphanRuns(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM runs WHERE task_id NOT IN (SELECT id FROM tasks)`)
+	if err != nil {
+		return 0, fmt.Errorf("清理孤儿运行记录: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		if err := s.resetRunSequenceIfEmpty(ctx); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+// CheckpointWAL 把 WAL 中的页面回写主库并截断 WAL 文件。
+//
+// 主库文件在删数据后不会自动变小，而 WAL 又可能长期维持在一个不小的尺寸；
+// 两者都不回收的话，界面上的"数据库占用"会一直虚高。
+func (s *SQLiteStore) CheckpointWAL(ctx context.Context) error {
+	var busy, logFrames, checkpointed int64
+	if err := s.db.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).
+		Scan(&busy, &logFrames, &checkpointed); err != nil {
+		return fmt.Errorf("截断 WAL 失败: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("数据库正被其它连接占用，WAL 未能完全截断")
 	}
 	return nil
 }

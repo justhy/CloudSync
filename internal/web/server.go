@@ -14,6 +14,7 @@ import (
 
 	"cloudsync/internal/config"
 	"cloudsync/internal/logging"
+	"cloudsync/internal/maintenance"
 	"cloudsync/internal/manager"
 	"cloudsync/internal/rclone"
 	"cloudsync/internal/retention"
@@ -35,6 +36,7 @@ type Server struct {
 	scheduler *scheduler.Scheduler
 	rclone    *rclone.Supervisor
 	retention *retention.Service
+	maint     *maintenance.Service
 	logger    *slog.Logger
 	auth      *auth
 	limiter   *loginLimiter
@@ -50,6 +52,7 @@ func New(
 	sch *scheduler.Scheduler,
 	sup *rclone.Supervisor,
 	ret *retention.Service,
+	maint *maintenance.Service,
 	logger *slog.Logger,
 ) *Server {
 	if logger == nil {
@@ -62,6 +65,7 @@ func New(
 		scheduler: sch,
 		rclone:    sup,
 		retention: ret,
+		maint:     maint,
 		logger:    logger.With("component", "web"),
 		auth:      newAuth(cfg.Server.Username, cfg.Server.Password, cfg.Server.SessionSecret, cfg.Server.SessionTTL.D()),
 		limiter:   newLoginLimiter(5, 15*time.Minute),
@@ -135,6 +139,8 @@ func (s *Server) routes() http.Handler {
 
 	mux.Handle("GET /api/settings", s.requireAuth(s.handleGetSettings))
 	mux.Handle("PUT /api/settings", s.requireAuth(s.handleUpdateSettings))
+	// 数据库瘦身：丢弃日志片段 / 裁剪记录 / 清孤儿 / 整理数据库文件。
+	mux.Handle("POST /api/maintenance/cleanup", s.requireAuth(s.handleCleanupDatabase))
 
 	mux.Handle("GET /api/events", s.requireAuth(s.handleEvents))
 
@@ -142,6 +148,8 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("POST /api/rclone/restart", s.requireAuth(s.handleRcloneRestart))
 	mux.Handle("GET /api/rclone/remotes", s.requireAuth(s.handleRemotes))
 	mux.Handle("GET /api/rclone/log", s.requireAuth(s.handleRcloneLog))
+	// 清空 rclone 输出缓冲（只影响内存里的日志，不碰任何运行记录）。
+	mux.Handle("POST /api/rclone/log/clear", s.requireAuth(s.handleRcloneLogClear))
 	mux.Handle("GET /api/rclone/list", s.requireAuth(s.handleBrowse))
 	mux.Handle("GET /api/rclone/about", s.requireAuth(s.handleAbout))
 	mux.Handle("GET /api/rclone/options", s.requireAuth(s.handleRcloneOptions))

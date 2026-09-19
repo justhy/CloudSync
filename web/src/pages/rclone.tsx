@@ -1,5 +1,5 @@
 import * as React from "react"
-import { Activity, Clock, Hash, RefreshCw, RotateCw, Server, Tag } from "lucide-react"
+import { Activity, Clock, Hash, Info, RefreshCw, RotateCw, Server, Tag, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -28,6 +28,8 @@ interface RcloneState {
     auto_restart: boolean
     journal_lines: number
     external: boolean
+    adopted: boolean
+    notice?: string
   }
   stats?: { bytes: number; totalBytes: number; transfers: number; errors: number; speed: number }
   memstats?: { Alloc: number; NumGC: number }
@@ -85,6 +87,25 @@ export function RclonePage() {
       await load()
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "重启失败")
+      // 重启失败时把日志一起刷新：失败原因（端口占用等）就在里面。
+      void loadLog()
+    }
+  }
+
+  async function clearLog() {
+    const ok = await confirm({
+      title: "确认清空 rclone 输出日志？",
+      description:
+        "只清空这里的 rclone 输出（内存缓冲），不会删除任何运行记录。正在运行的任务，其日志片段会从清空那一刻开始记录。",
+      confirmText: "清空",
+    })
+    if (!ok) return
+    try {
+      const res = await api.rcloneLogClear()
+      setLog([])
+      toast.success(res.cleared > 0 ? `已清空 ${res.cleared} 行日志` : "日志本来就是空的")
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "清空失败")
     }
   }
 
@@ -123,7 +144,13 @@ export function RclonePage() {
         ["配置文件", s.config_file || "（rclone 默认）"],
         [
           "托管方式",
-          s.external ? "外部实例（不由本程序管理）" : s.auto_start ? "本程序托管" : "未托管",
+          s.external
+            ? "外部实例（不由本程序管理）"
+            : s.adopted
+              ? `接管既有实例（pid ${s.pid || "未知"}）`
+              : s.auto_start
+                ? "本程序托管"
+                : "未托管",
         ],
         ["自动重启", s.auto_restart ? `开启（已重启 ${s.restarts ?? 0} 次）` : "关闭"],
         ["启动时间", fmtTime(s.started_at)],
@@ -179,17 +206,25 @@ export function RclonePage() {
             </Button>
           ) : null}
         </CardHeader>
-        <CardContent className="grid gap-2 lg:grid-cols-2">
-          {rows.length ? (
-            rows.map(([k, v]) => (
-              <div key={k} className="flex gap-3 border-b py-1.5 text-sm last:border-0">
-                <span className="w-24 shrink-0 text-muted-foreground">{k}</span>
-                <span className="tabular min-w-0 break-all">{v}</span>
-              </div>
-            ))
-          ) : (
-            <p className="text-sm text-muted-foreground">加载中…</p>
-          )}
+        <CardContent className="space-y-3">
+          {s?.notice ? (
+            <div className="flex gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm">
+              <Info className="mt-0.5 size-4 shrink-0 text-amber-600" />
+              <span className="min-w-0 break-words">{s.notice}</span>
+            </div>
+          ) : null}
+          <div className="grid gap-2 lg:grid-cols-2">
+            {rows.length ? (
+              rows.map(([k, v]) => (
+                <div key={k} className="flex gap-3 border-b py-1.5 text-sm last:border-0">
+                  <span className="w-24 shrink-0 text-muted-foreground">{k}</span>
+                  <span className="tabular min-w-0 break-all">{v}</span>
+                </div>
+              ))
+            ) : (
+              <p className="text-sm text-muted-foreground">加载中…</p>
+            )}
+          </div>
         </CardContent>
       </Card>
 
@@ -224,6 +259,9 @@ export function RclonePage() {
         <CardHeader className="flex-row items-center justify-between space-y-0 gap-2">
           <div>
             <CardTitle className="text-base">rclone 输出日志</CardTitle>
+            <CardDescription className="mt-1">
+              最新的 {log.length} 行（内存缓冲，最多保留配置的 journal_size 行）
+            </CardDescription>
           </div>
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2">
@@ -234,6 +272,14 @@ export function RclonePage() {
             </div>
             <Button variant="outline" size="sm" onClick={() => void loadLog()}>
               <RefreshCw /> 刷新
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void clearLog()}
+              disabled={log.length === 0}
+            >
+              <Trash2 /> 清空
             </Button>
           </div>
         </CardHeader>
