@@ -67,7 +67,7 @@ func New(
 		retention: ret,
 		maint:     maint,
 		logger:    logger.With("component", "web"),
-		auth:      newAuth(cfg.Server.Username, cfg.Server.Password, cfg.Server.SessionSecret, cfg.Server.SessionTTL.D()),
+		auth:      newAuth(cfg.Server.Username, cfg.Server.Password, cfg.Server.SessionSecret, cfg.Server.SessionTTL.D(), cfg.Server.TrustedProxy),
 		limiter:   newLoginLimiter(5, 15*time.Minute),
 	}
 	s.http = &http.Server{
@@ -192,6 +192,12 @@ func (s *Server) routes() http.Handler {
 func spaHandler(static fs.FS, fileServer http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/")
+		// 未注册的 /api/* 绝不能回退到 index.html：前端会把这段 HTML 当 JSON 解析，
+		// 报出一个和真实原因（接口写错/版本不匹配）毫无关系的错误。直接给 JSON 404。
+		if path == "api" || strings.HasPrefix(path, "api/") {
+			writeErr(w, http.StatusNotFound, "not_found", "接口不存在")
+			return
+		}
 		if path == "" {
 			serveIndex(w, r, static)
 			return
@@ -252,8 +258,6 @@ type statusRecorder struct {
 	http.ResponseWriter
 	status int
 	bytes  int
-	// hijackDisabled 标记该响应是否为 SSE（长连接）。
-	stream bool
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
@@ -283,9 +287,6 @@ func (s *Server) requestLogger(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w}
-		if strings.HasSuffix(r.URL.Path, "/api/events") {
-			rec.stream = true
-		}
 
 		next.ServeHTTP(rec, r)
 

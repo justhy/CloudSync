@@ -83,6 +83,11 @@ func decodeJSON(r *http.Request, dst any) error {
 	if err := dec.Decode(dst); err != nil {
 		return invalid("请求体格式错误: %v", err)
 	}
+	// 只允许一个 JSON 值。后面还有内容（`{} {}`、`{}garbage`）说明客户端发的东西
+	// 和它以为的不一样，静默忽略会掩盖 bug——宁可报错。读到 EOF 才算干净。
+	if err := dec.Decode(new(struct{})); !errors.Is(err, io.EOF) {
+		return invalid("请求体格式错误: 只能包含一个 JSON 对象")
+	}
 	return nil
 }
 

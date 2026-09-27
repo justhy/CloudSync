@@ -18,8 +18,9 @@ func (s *Server) handleListRuns(w http.ResponseWriter, r *http.Request) {
 
 	filter := store.RunFilter{
 		TaskID: int64(queryInt(r, "task_id", 0)),
-		Limit:  queryInt(r, "limit", 50),
-		Offset: queryInt(r, "offset", 0),
+		// 先钳制再查询，回显的 limit/offset 才是真正生效的值。
+		Limit:  store.ClampRunLimit(queryInt(r, "limit", store.DefaultRunLimit)),
+		Offset: store.ClampRunOffset(queryInt(r, "offset", 0)),
 		Active: queryBool(r, "active"),
 	}
 	if raw := strings.TrimSpace(q.Get("status")); raw != "" {

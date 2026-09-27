@@ -173,12 +173,18 @@ func run() error {
 	mgr := manager.New(st, sup.Client(), rclone.NewRunner(cfg.Rclone), sup.Journal(), manager.Options{
 		MaxConcurrent:    cfg.Scheduler.MaxConcurrentRuns,
 		DefaultTimeout:   cfg.Scheduler.DefaultTimeout.D(),
-		SkipOverlap:      cfg.Scheduler.SkipOverlap,
 		HistoryLimit:     cfg.Storage.HistoryLimit,
 		JournalTailLines: 200,
 		PollInterval:     2 * time.Second,
 	}, logger)
 	mgr.SetBaseContext(rootCtx)
+
+	// scheduler.skip_overlap 已废弃：同一任务的重叠现在由管理器无条件拦截
+	// （手动与定时触发一视同仁）。保留该字段只为兼容旧配置，这里提示一下。
+	if !cfg.Scheduler.SkipOverlap {
+		logger.Warn("配置项 scheduler.skip_overlap 已废弃且不再生效：同一任务上一轮未结束时，" +
+			"本次触发（无论手动还是定时）都会被跳过")
+	}
 
 	// 3.5) 运行记录保留策略（过期清理）
 	//

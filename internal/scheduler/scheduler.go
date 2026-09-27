@@ -313,24 +313,24 @@ func (s *Scheduler) fire(taskID int64, taskName string) {
 		return
 	}
 
-	if s.cfg.SkipOverlap {
-		if running := s.mgr.RunningByTask(task.ID); running != nil && !running.Status.Finished() {
-			s.logger.Warn("上一轮尚未结束，跳过本次定时触发",
-				logging.Task(task.ID, task.Name),
-				"running_run_id", running.ID,
-				"started_at", running.StartedAt.Format(time.RFC3339),
-			)
-			s.syncNextRun(ctx, task.ID)
-			return
-		}
-	}
+	// 同一任务的重叠判定统一由管理器负责（手动与定时一视同仁）：这里直接触发，
+	// 若上一轮尚未结束，Trigger 会返回 ErrTaskBusy 并在下面记一条可读的日志。
 
 	run, err := s.mgr.Trigger(ctx, task, store.TriggerCron)
 	switch {
 	case err == nil:
 		s.logger.Info("定时触发成功",
 			logging.Task(task.ID, task.Name), logging.Run(run.ID, string(run.Status)))
-	case errors.Is(err, manager.ErrTaskBusy), errors.Is(err, manager.ErrCapacity):
+	case errors.Is(err, manager.ErrTaskBusy):
+		// 上一轮尚未结束，本次定时触发被跳过。Trigger 在忙时会连同"正在运行的那条"
+		// 一起返回，据此把运行号与开始时间记进日志，方便排查。
+		attrs := []any{logging.Task(task.ID, task.Name), logging.Err(err)}
+		if run != nil {
+			attrs = append(attrs, "running_run_id", run.ID,
+				"started_at", run.StartedAt.Format(time.RFC3339))
+		}
+		s.logger.Warn("同样的任务正在运行，跳过本次定时触发", attrs...)
+	case errors.Is(err, manager.ErrCapacity):
 		s.logger.Warn("定时触发被跳过", logging.Task(task.ID, task.Name), logging.Err(err))
 	case errors.Is(err, manager.ErrTaskDisabled):
 		s.logger.Info("任务已禁用，忽略定时触发", logging.Task(task.ID, task.Name))

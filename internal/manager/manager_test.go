@@ -256,7 +256,7 @@ func TestTriggerSuccess(t *testing.T) {
 			Transfers: 4, TotalTransfers: 4, Speed: 1024, Checks: 8, Renames: 1,
 		}
 	}
-	m, st := newTestManager(t, rc, Options{MaxConcurrent: 2, SkipOverlap: true})
+	m, st := newTestManager(t, rc, Options{MaxConcurrent: 2})
 	task := createTask(t, st, func(task *store.Task) {
 		task.ExtraFlags = map[string]any{"transfers": float64(8)}
 	})
@@ -483,7 +483,7 @@ func TestTaskTimeoutMarksFailed(t *testing.T) {
 	}
 }
 
-func TestSkipOverlapRejectsSecondTrigger(t *testing.T) {
+func TestSameTaskRejectsSecondTrigger(t *testing.T) {
 	rc := &stubRC{}
 	release := make(chan struct{})
 	rc.jobFn = func(jobID int64) (*rclone.JobStatus, error) {
@@ -494,7 +494,7 @@ func TestSkipOverlapRejectsSecondTrigger(t *testing.T) {
 			return &rclone.JobStatus{ID: jobID, Finished: false}, nil
 		}
 	}
-	m, st := newTestManager(t, rc, Options{MaxConcurrent: 2, SkipOverlap: true})
+	m, st := newTestManager(t, rc, Options{MaxConcurrent: 2})
 	task := createTask(t, st, nil)
 
 	if _, err := m.Trigger(context.Background(), task, store.TriggerManual); err != nil {
@@ -502,6 +502,7 @@ func TestSkipOverlapRejectsSecondTrigger(t *testing.T) {
 	}
 	waitFor(t, 2*time.Second, func() bool { return m.ActiveCount() == 1 }, "首个任务开始")
 
+	// 手动触发后，同一任务的定时触发也应被跳过。
 	_, err := m.Trigger(context.Background(), task, store.TriggerCron)
 	if !errors.Is(err, ErrTaskBusy) {
 		t.Fatalf("期望 ErrTaskBusy，得到 %v", err)
@@ -522,8 +523,8 @@ func TestCapacityLimit(t *testing.T) {
 			return &rclone.JobStatus{ID: jobID, Finished: false}, nil
 		}
 	}
-	// SkipOverlap=false 以便第二个任务也尝试抢占许可
-	m, st := newTestManager(t, rc, Options{MaxConcurrent: 1, SkipOverlap: false})
+	// 两个不同任务：占用唯一许可后，第二个应被并发上限挡住（与重叠无关）。
+	m, st := newTestManager(t, rc, Options{MaxConcurrent: 1})
 	t1 := createTask(t, st, func(x *store.Task) { x.Name = "t1" })
 	t2 := createTask(t, st, func(x *store.Task) { x.Name = "t2" })
 
@@ -970,8 +971,8 @@ func TestChainForcesNoOverlap(t *testing.T) {
 	rc.jobFn = func(jobID int64) (*rclone.JobStatus, error) {
 		return &rclone.JobStatus{ID: jobID, Finished: false}, nil
 	}
-	// SkipOverlap 显式关闭也不行：多步骤任务重叠会让"最近一次结果"失去意义。
-	m, st := newTestManager(t, rc, Options{MaxConcurrent: 2, SkipOverlap: false})
+	// 同一任务的重叠无条件拦截：多步骤任务重叠会让"最近一次结果"失去意义。
+	m, st := newTestManager(t, rc, Options{MaxConcurrent: 2})
 	task := createChainTask(t, st, chainSteps(store.OnErrorContinue))
 
 	if _, err := m.Trigger(context.Background(), task, store.TriggerManual); err != nil {
@@ -992,7 +993,7 @@ func TestCancelAllStopsEverything(t *testing.T) {
 	rc.jobFn = func(jobID int64) (*rclone.JobStatus, error) {
 		return &rclone.JobStatus{ID: jobID, Finished: false}, nil
 	}
-	m, st := newTestManager(t, rc, Options{MaxConcurrent: 3, SkipOverlap: false})
+	m, st := newTestManager(t, rc, Options{MaxConcurrent: 3})
 	t1 := createTask(t, st, func(x *store.Task) { x.Name = "a" })
 	t2 := createTask(t, st, func(x *store.Task) { x.Name = "b" })
 	for _, task := range []*store.Task{t1, t2} {

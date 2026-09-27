@@ -89,7 +89,8 @@ export function RunDetailDialog({
       toast.success(`已从步骤 ${failedStep.position + 1} 重新触发，运行 #${res.run.id}`)
     } catch (err) {
       const msg = err instanceof Error ? err.message : "触发失败"
-      ;(msg.includes("并发") || msg.includes("冷却") ? toast.warning : toast.error)(msg)
+      // 409 同一任务正在运行 / 并发上限 / 429 冷却中：属于预期内的业务拒绝，用警告语气。
+      ;(msg.includes("正在运行") || msg.includes("并发") || msg.includes("冷却") ? toast.warning : toast.error)(msg)
     }
   }
 

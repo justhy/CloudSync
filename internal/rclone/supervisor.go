@@ -454,6 +454,22 @@ func (s *Supervisor) buildArgs() []string {
 	return args
 }
 
+// redactArgs 返回一份用于日志/展示的参数副本，把 --rc-pass 的值替换成 ***。
+//
+// buildArgs 的返回值是真正要交给 exec 的命令行，必须保留明文密码；但凡是要
+// 落进 journal、宿主日志或错误信息的地方，都得先过这一道，否则 RC 密码会顺着
+// 「rclone 输出日志」接口泄漏到前端。--rc-user 不是凭据，保持原样。
+func redactArgs(args []string) []string {
+	out := make([]string, len(args))
+	copy(out, args)
+	for i := 0; i < len(out)-1; i++ {
+		if out[i] == "--rc-pass" {
+			out[i+1] = "***"
+		}
+	}
+	return out
+}
+
 // spawn 启动子进程。
 //
 // 这里是整个包唯一真正创建 rclone 进程的地方，所以"该不该拉"的判断也放在这里：
@@ -472,13 +488,15 @@ func (s *Supervisor) spawn() error {
 
 	args := s.buildArgs()
 	binary := resolveBinary(s.cfg)
+	// 日志里用脱敏后的参数，避免 RC 密码落进 journal / 宿主日志。
+	safeArgs := redactArgs(args)
 
 	// 从这里开始，这个子进程的任何退出都算真的故障，reap 必须照常排自动重启
 	// （stopCurrent 曾把它置位，那是为了吃掉"我们自己杀掉旧实例"那一次）。
 	s.stopIntent.Store(false)
 
 	s.setState(StateStarting, nil)
-	s.note("正在启动 rclone rcd：%s %s", binary, strings.Join(args, " "))
+	s.note("正在启动 rclone rcd：%s %s", binary, strings.Join(safeArgs, " "))
 
 	cmd := exec.Command(binary, args...)
 	cmd.Env = os.Environ()
@@ -497,7 +515,7 @@ func (s *Supervisor) spawn() error {
 		if errors.Is(err, exec.ErrNotFound) {
 			return fmt.Errorf("找不到 rclone 可执行文件 %q，请设置 rclone.path 或将其加入 PATH: %w", binary, err)
 		}
-		return fmt.Errorf("启动 rclone rcd 失败 (%s %s): %w", binary, strings.Join(args, " "), err)
+		return fmt.Errorf("启动 rclone rcd 失败 (%s %s): %w", binary, strings.Join(safeArgs, " "), err)
 	}
 
 	exited := make(chan struct{})
@@ -519,7 +537,7 @@ func (s *Supervisor) spawn() error {
 		"pid", cmd.Process.Pid,
 		"binary", binary,
 		"rc_addr", s.cfg.RCAddr,
-		"args", args,
+		"args", safeArgs,
 	)
 
 	go s.reap(cmd, exited, mark)
@@ -1013,6 +1031,29 @@ func (s *Supervisor) setState(st State, err error) {
 	}
 }
 
+// lockOpCtx 在 ctx 内获取 opMu，ctx 结束则放弃并返回其错误。
+//
+// 供退出路径使用：持有 opMu 的一方可能卡在"等 RC 地址释放"等带超时的等待里，
+// 直接 Lock 会把退出无限期拖住。其余调用方（Start / Restart / 监管协程）持有
+// 时间都有明确上界，继续用直接 Lock 即可。
+func (s *Supervisor) lockOpCtx(ctx context.Context) error {
+	if s.opMu.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if s.opMu.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
 // Stop 优雅关闭 rcd 子进程。
 //
 // 顺序：core/quit -> 等待自行退出 -> SIGTERM/强杀兜底 -> 等待监管协程收尾。
@@ -1021,7 +1062,12 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 
 	// 与监管协程、手动重启互斥：否则关停过程中对方刚好拉起一个新子进程，
 	// 就会留下一个没人管的 rclone 继续占着 RC 地址。
-	s.opMu.Lock()
+	//
+	// 这里用带 ctx 的获取方式而不是直接 Lock：持有方（手动重启、监管协程）可能
+	// 正卡在"等 RC 地址释放"上，直接 Lock 会把退出无限期拖住。等不到就如实返回。
+	if err := s.lockOpCtx(ctx); err != nil {
+		return fmt.Errorf("等待实例操作锁: %w", err)
+	}
 	defer s.opMu.Unlock()
 
 	s.mu.RLock()

@@ -32,17 +32,21 @@ type auth struct {
 	pass   string
 	secret []byte
 	ttl    time.Duration
+	// trustProxy 决定是否采信 X-Forwarded-Proto。与 clientIP 采信 X-Forwarded-For
+	// 用的是同一个开关：直连部署下这些头都可由客户端伪造，不能当依据。
+	trustProxy bool
 }
 
-func newAuth(user, pass, secret string, ttl time.Duration) *auth {
+func newAuth(user, pass, secret string, ttl time.Duration, trustProxy bool) *auth {
 	if ttl <= 0 {
 		ttl = 12 * time.Hour
 	}
 	return &auth{
-		user:   user,
-		pass:   pass,
-		secret: []byte(secret),
-		ttl:    ttl,
+		user:       user,
+		pass:       pass,
+		secret:     []byte(secret),
+		ttl:        ttl,
+		trustProxy: trustProxy,
 	}
 }
 
@@ -106,7 +110,7 @@ func (a *auth) setCookie(w http.ResponseWriter, r *http.Request, token string, e
 		Expires:  exp,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   requestIsTLS(r),
+		Secure:   a.requestIsTLS(r),
 	})
 }
 
@@ -119,12 +123,20 @@ func (a *auth) clearCookie(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
-		Secure:   requestIsTLS(r),
+		Secure:   a.requestIsTLS(r),
 	})
 }
 
-func requestIsTLS(r *http.Request) bool {
-	return r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
+// requestIsTLS 判断当前请求是否经 HTTPS 到达。
+//
+// 直接看 r.TLS 永远可信；X-Forwarded-Proto 只有在本程序确实位于受信反向代理之后
+// （server.trusted_proxy）时才采信——直连时该头可由任意客户端伪造，据此把 Cookie
+// 标成 Secure 会让浏览器在明文 HTTP 上拒绝回传，凭空制造"登录后又掉线"。
+func (a *auth) requestIsTLS(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return a.trustProxy && strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
 
 // clientIP 返回客户端 IP，trustProxy 为 true 时采信 X-Forwarded-For。

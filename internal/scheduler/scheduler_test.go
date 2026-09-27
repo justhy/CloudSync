@@ -18,6 +18,9 @@ import (
 type fakeRC struct {
 	mu    chan struct{}
 	calls int
+	// jobGate 非 nil 时，job/status 会一直返回"未完成"，直到该 channel 关闭。
+	// 用于构造"上一轮尚未结束"的场景（必须在触发前设置，避免与轮询 goroutine 竞争）。
+	jobGate chan struct{}
 }
 
 func (f *fakeRC) StartAsync(_ context.Context, method string, params map[string]any, group string) (int64, error) {
@@ -32,6 +35,13 @@ func (f *fakeRC) Stats(_ context.Context, group string) (*rclone.Stats, error) {
 }
 
 func (f *fakeRC) JobStatus(_ context.Context, jobID int64) (*rclone.JobStatus, error) {
+	if f.jobGate != nil {
+		select {
+		case <-f.jobGate:
+		default:
+			return &rclone.JobStatus{ID: jobID, Finished: false}, nil
+		}
+	}
 	return &rclone.JobStatus{ID: jobID, Finished: true, Success: true}, nil
 }
 
@@ -67,7 +77,6 @@ func newScheduler(t *testing.T, mutate func(*config.SchedulerConfig)) (*Schedule
 		Enabled:           true,
 		Seconds:           true,
 		MaxConcurrentRuns: 2,
-		SkipOverlap:       true,
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -293,7 +302,6 @@ func TestCronActuallyFires(t *testing.T) {
 	// 秒级精度下每秒触发一次，验证完整链路：cron -> 触发 -> 运行记录生成。
 	sch, st, mgr, rc := newScheduler(t, func(c *config.SchedulerConfig) {
 		c.Seconds = true
-		c.SkipOverlap = true
 	})
 
 	ctx := context.Background()
@@ -343,6 +351,54 @@ func TestCronActuallyFires(t *testing.T) {
 		got, err := st.GetTask(ctx, task.ID)
 		return err == nil && got.NextRunAt != nil
 	}, "回写 next_run_at")
+}
+
+// 定时触发时，若该任务上一轮尚未结束，本次触发必须被跳过（不新建运行记录）。
+// 这直接对应"执行定时任务时判断当前任务是否还在跑"的要求。
+func TestFireSkipsWhilePreviousRunActive(t *testing.T) {
+	sch, st, mgr, rc := newScheduler(t, func(c *config.SchedulerConfig) {
+		c.Seconds = true
+	})
+	ctx := context.Background()
+
+	task := &store.Task{Name: "长任务", Kind: store.KindSync, Source: "a:", Dest: "b:",
+		CronExpr: "0 0 3 * * *", Enabled: true}
+	if err := st.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	// 让首个运行一直"进行中"，模拟上一轮尚未结束。必须在触发前设置 jobGate，
+	// 否则会与 manager 的轮询 goroutine 竞争。
+	gate := make(chan struct{})
+	rc.jobGate = gate
+
+	loaded, err := st.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.Trigger(ctx, loaded, store.TriggerManual); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return mgr.ActiveCount() == 1 }, "首个运行开始")
+
+	_, before, err := st.ListRuns(ctx, store.RunFilter{TaskID: task.ID, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 直接调用 cron 的触发入口（等价于到点触发）。
+	sch.fire(task.ID, task.Name)
+
+	_, after, err := st.ListRuns(ctx, store.RunFilter{TaskID: task.ID, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("上一轮未结束时应跳过本次定时触发：前 %d 条，后 %d 条", before, after)
+	}
+
+	close(gate)
+	waitFor(t, 3*time.Second, func() bool { return mgr.ActiveCount() == 0 }, "运行结束")
 }
 
 func TestDisabledSchedulerDoesNotRegister(t *testing.T) {

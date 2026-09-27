@@ -20,6 +20,7 @@ import (
 	"io"
 	"log/slog"
 	"path"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -32,8 +33,8 @@ import (
 
 // 管理器对外暴露的错误。
 var (
-	// ErrTaskBusy 表示同一任务已有一轮正在运行。
-	ErrTaskBusy = errors.New("该任务正在运行中")
+	// ErrTaskBusy 表示同一任务已有一轮正在运行（本次触发被跳过）。
+	ErrTaskBusy = errors.New("同样的任务正在运行")
 	// ErrCapacity 表示全局并发已满。
 	ErrCapacity = errors.New("并发任务数已达上限，请稍后重试")
 	// ErrTaskDisabled 表示任务被禁用。
@@ -64,8 +65,6 @@ type Options struct {
 	MaxConcurrent int
 	// DefaultTimeout 为 0 表示不限制单次任务时长。
 	DefaultTimeout time.Duration
-	// SkipOverlap 为 true 时同一任务不允许并发执行。
-	SkipOverlap bool
 	// PollInterval 是进度轮询间隔。
 	PollInterval time.Duration
 	// HistoryLimit 是单任务保留的运行记录条数上限。
@@ -322,12 +321,11 @@ func (m *Manager) TriggerFrom(ctx context.Context, task *store.Task, trigger sto
 		return nil, fmt.Errorf("起始步骤 %d 超出范围（共 %d 步）", fromStep+1, len(steps))
 	}
 
-	if m.opts.SkipOverlap || len(steps) > 1 {
-		// 多步骤任务强制串行不重叠：链的时长=各步之和+间隔，很容易超过触发周期，
-		// 允许重叠会让几轮链同时跑，互相抢带宽且让"最近一次结果"失去意义。
-		if running := m.RunningByTask(task.ID); running != nil && !running.Status.Finished() {
-			return running, fmt.Errorf("%w（运行 #%d 尚未结束）", ErrTaskBusy, running.ID)
-		}
+	// 快路径：同一任务已有运行在跑时直接挡掉，省下抢并发许可与建记录的代价。
+	// 手动与定时触发一视同仁：只要同一任务还有一轮没结束，本次触发就被跳过。
+	// 真正保证"不重叠"的是下面注册时的锁内复查。
+	if running := m.RunningByTask(task.ID); running != nil && !running.Status.Finished() {
+		return running, fmt.Errorf("%w（运行 #%d 尚未结束）", ErrTaskBusy, running.ID)
 	}
 
 	// 非阻塞抢占并发许可：满则直接告知调用方，避免请求堆积。
@@ -384,6 +382,24 @@ func (m *Manager) TriggerFrom(ctx context.Context, task *store.Task, trigger sto
 		fromStep: fromStep,
 	}
 	m.mu.Lock()
+	// 权威的重叠判定放在锁内。上面的提前检查只是快路径：两次触发（如手动 + 定时）
+	// 可能都先通过了它，然后在注册前交错，结果给同一个任务挂上两条运行。这里再查
+	// 一次 byTask，把窗口彻底关掉。
+	if existingID, ok := m.byTask[task.ID]; ok {
+		if ex, ok2 := m.active[existingID]; ok2 && !ex.run.Status.Finished() {
+			m.mu.Unlock()
+			cancelRun()
+			<-m.sem
+			// 刚创建的 pending 记录从未执行过，直接删掉，别在历史里留噪音。
+			delCtx, delCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			if derr := m.store.DeleteRun(delCtx, run.ID); derr != nil {
+				m.logger.Warn("清理被跳过运行的记录失败", logging.Run(run.ID, "pending"), logging.Err(derr))
+			}
+			delCancel()
+			exSnap := *ex.run
+			return &exSnap, fmt.Errorf("%w（运行 #%d 尚未结束）", ErrTaskBusy, existingID)
+		}
+	}
 	m.active[run.ID] = a
 	m.byTask[task.ID] = run.ID
 	snap := *run
@@ -516,6 +532,29 @@ func (m *Manager) execute(parent context.Context, a *activeRun) {
 			"errors", final.Errors,
 			logging.Err(errorFromString(final.Error)),
 		)
+	}()
+
+	// panic 兜底。这条 goroutine 一旦 panic，进程会直接崩，而 run 会永远停在
+	// running——用户看到的是一条卡死且无法取消的记录。defer 是 LIFO，所以这个
+	// recover 写在 cleanup defer 之后，会先于清理执行：先把运行收敛成失败，
+	// 再让 cleanup 照常释放并发许可、摘除 active/byTask、广播终态。
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		m.logger.Error("任务执行 panic，已强制收敛为失败",
+			logging.Task(task.ID, task.Name),
+			logging.Run(run.ID, string(run.Status)),
+			"panic", fmt.Sprint(rec),
+			"stack", string(debug.Stack()),
+		)
+		m.mu.Lock()
+		finished := run.Status.Finished()
+		m.mu.Unlock()
+		if !finished {
+			m.finish(run, a, store.StatusFailed, "任务执行异常终止（内部错误）", nil, nil)
+		}
 	}()
 
 	// 按步骤串行执行。整条链共用一个运行记录，终态由所有步骤共同决定。

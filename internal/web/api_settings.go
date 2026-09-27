@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"cloudsync/internal/config"
+	"cloudsync/internal/maintenance"
 	"cloudsync/internal/retention"
 	"cloudsync/internal/store"
 )
@@ -67,6 +68,10 @@ func (s *Server) handleUpdateSettings(w http.ResponseWriter, r *http.Request) {
 //
 // 清理后做一次 VACUUM：SQLite 删行只标记空闲页，文件不会变小，
 // 用户看不到磁盘回落会以为没生效。
+//
+// 这一步必须走 maintenance 的回收路径，而不是直接调 store.Vacuum —— 后者会绕过
+// 「有任务在运行就不整库」的闸门，而 VACUUM 要重写整个库，期间所有进度回写都会被
+// 那条唯一的数据库连接堵住，用户看到的是"传输卡住了"。
 func (s *Server) handlePruneRuns(w http.ResponseWriter, r *http.Request) {
 	if s.retention == nil {
 		writeErr(w, http.StatusNotImplemented, "not_enabled", "保留策略服务未启用")
@@ -78,18 +83,31 @@ func (s *Server) handlePruneRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	vacuumed := false
+	skipped := ""
 	if deleted > 0 {
-		if verr := s.store.Vacuum(r.Context()); verr != nil {
+		if s.maint != nil {
+			res, cerr := s.maint.Cleanup(r.Context(), maintenance.Options{Reclaim: true})
+			if cerr != nil {
+				s.logger.Warn("整理数据库失败", "err", cerr.Error())
+			}
+			vacuumed = res.Vacuumed
+			skipped = res.ReclaimSkipped
+		} else if verr := s.store.Vacuum(r.Context()); verr != nil {
+			// maint 未启用（理论上不会）时退回直连，保证功能不丢。
 			s.logger.Warn("整理数据库失败", "err", verr.Error())
 		} else {
 			vacuumed = true
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"ok":       true,
 		"deleted":  deleted,
 		"vacuumed": vacuumed,
-	})
+	}
+	if skipped != "" {
+		payload["reclaim_skipped"] = skipped
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 // settingsPayload 汇总设置页需要的全部信息。

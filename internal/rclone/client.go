@@ -327,15 +327,6 @@ func (c *Client) Stats(ctx context.Context, group string) (*Stats, error) {
 	return &s, nil
 }
 
-// StatsReset 重置统计。group 非空时只重置该组。
-func (c *Client) StatsReset(ctx context.Context, group string) error {
-	params := map[string]any{}
-	if group != "" {
-		params["group"] = group
-	}
-	return c.Call(ctx, "core/stats-reset", params, nil)
-}
-
 // GroupList 返回当前存在的统计组名（core/group-list）。
 func (c *Client) GroupList(ctx context.Context) ([]string, error) {
 	var out struct {
@@ -407,17 +398,6 @@ func (c *Client) JobStatus(ctx context.Context, jobID int64) (*JobStatus, error)
 		return nil, err
 	}
 	return &st, nil
-}
-
-// JobList 返回全部未过期的 job id。
-func (c *Client) JobList(ctx context.Context) ([]int64, error) {
-	var out struct {
-		JobIDs []int64 `json:"jobids"`
-	}
-	if err := c.Call(ctx, "job/list", nil, &out); err != nil {
-		return nil, err
-	}
-	return out.JobIDs, nil
 }
 
 // StopJob 请求停止指定 job（job/stop），其内部会取消对应的 context。
@@ -559,32 +539,6 @@ func MethodForKind(kind string) (string, error) {
 	}
 }
 
-// SplitRemote 把 rclone 路径拆成「远端名」与「远端内路径」。
-//
-// RC 的部分方法（如 operations/list、operations/deletefile）要求把两者分开传：
-// fs 只接受形如 "115Drive:" 的远端名，目录与文件名要放进 remote。
-// 而任务里的 Dest 是合在一起的 "115Drive:音乐/自收集"。
-//
-// 只在**第一个**冒号处切分：Windows 绝对路径含盘符（C:\...），
-// rclone 的本地路径写法是 "C:/..." 或 "/..."，冒号出现在盘符之后时不能按远端解析。
-func SplitRemote(remote string) (fs, path string, err error) {
-	remote = strings.TrimSpace(remote)
-	if remote == "" {
-		return "", "", fmt.Errorf("路径为空")
-	}
-	i := strings.Index(remote, ":")
-	if i < 0 {
-		return "", "", fmt.Errorf("路径 %q 缺少远端分隔符 \":\"", remote)
-	}
-	// 盘符场景："C:/xxx" 的冒号在下标 1，且其后紧跟路径分隔符，按本地路径处理。
-	if i == 1 && strings.ContainsAny(remote[0:1], `ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz`) {
-		return "", "", fmt.Errorf("路径 %q 是本地路径，没有远端名", remote)
-	}
-	fs = remote[:i+1]
-	path = strings.TrimPrefix(remote[i+1:], "/")
-	return fs, path, nil
-}
-
 // ParamNameForKind 返回任务类型对应的源参数名。
 // 注意 rclone 各方法参数名不一致：sync/bisync 用 path1/path2，
 // 其余用 srcFs/dstFs，operations/* 用 fs。
@@ -598,22 +552,6 @@ func ParamNamesForKind(kind string) (srcParam, dstParam string) {
 		return "fs", "fs"
 	}
 }
-
-// ParseFlags 保留占位：便于未来支持从字符串解析 extra_flags。
-func ParseFlags(s string) (map[string]any, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, nil
-	}
-	out := map[string]any{}
-	if err := json.Unmarshal([]byte(s), &out); err != nil {
-		return nil, fmt.Errorf("解析参数字符串: %w", err)
-	}
-	return out, nil
-}
-
-// Int64Ptr 是便捷构造。
-func Int64Ptr(v int64) *int64 { return &v }
 
 // FormatBytes 将字节数格式化为人类可读字符串。
 func FormatBytes(n int64) string {

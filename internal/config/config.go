@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -221,7 +222,8 @@ type SchedulerConfig struct {
 	MaxConcurrentRuns int `yaml:"max_concurrent_runs"`
 	// DefaultTimeout 是任务未显式设置超时时的默认值，<=0 表示不限制。
 	DefaultTimeout Duration `yaml:"default_timeout"`
-	// SkipOverlap 为 true 时，同一任务上一轮未结束则跳过本次触发。
+	// SkipOverlap 已废弃：同一任务的重叠现在无条件拦截（手动与定时一视同仁），
+	// 该字段不再影响行为，仅保留以兼容旧配置文件（严格模式下未知字段会报错）。
 	SkipOverlap bool `yaml:"skip_overlap"`
 }
 
@@ -271,7 +273,7 @@ func Default() *Config {
 			MaxConcurrentRuns: 4,
 			// DefaultTimeout 刻意留成 0（不限制）。曾默认 24h，但大目录的首次同步
 			// 动辄十几小时，被上限砍断时用户看到的是"跑了大半天白跑"，比卡住更难接受；
-			// 而"别堆积"由 skip_overlap 与 cron 兜住，真卡死了还能手动取消。
+			// 而"别堆积"由"同一任务不重叠"（现已无条件）与 cron 兜住，真卡死了还能手动取消。
 			SkipOverlap: true,
 		},
 		Log: LogConfig{
@@ -320,7 +322,9 @@ func Load(path string) (*Config, error) {
 		}
 		dec := yaml.NewDecoder(strings.NewReader(string(raw)))
 		dec.KnownFields(true)
-		if err := dec.Decode(cfg); err != nil && !errors.Is(err, os.ErrClosed) {
+		// 空文件（或仅含注释/空白的文件）会让 Decode 返回 io.EOF，这属于
+		// "没写任何配置"的正常情形，应当保持内置默认值继续走；其余解析错误才拦。
+		if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("解析配置文件 %s: %w", resolved, err)
 		}
 	}

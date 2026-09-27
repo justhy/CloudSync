@@ -807,17 +807,38 @@ func (s *SQLiteStore) GetRun(ctx context.Context, id int64) (*Run, error) {
 	return scanRun(row)
 }
 
+// 运行记录列表分页的取值边界。HTTP 层回显分页参数时也复用这两个钳制函数，
+// 保证"回显给客户端的值"与"实际生效的值"一致，分页不会算错。
+const (
+	// DefaultRunLimit 是未指定 limit 时的每页条数。
+	DefaultRunLimit = 50
+	// MaxRunLimit 是每页条数的上限，防止一次拉爆内存。
+	MaxRunLimit = 500
+)
+
+// ClampRunLimit 把请求的每页条数收敛到 [1, MaxRunLimit]，<=0 时取默认值。
+func ClampRunLimit(n int) int {
+	if n <= 0 {
+		return DefaultRunLimit
+	}
+	if n > MaxRunLimit {
+		return MaxRunLimit
+	}
+	return n
+}
+
+// ClampRunOffset 把请求的偏移收敛到 >= 0。
+func ClampRunOffset(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
 // ListRuns 按条件分页查询，返回记录与总数。
 func (s *SQLiteStore) ListRuns(ctx context.Context, f RunFilter) ([]*Run, int, error) {
-	if f.Limit <= 0 {
-		f.Limit = 50
-	}
-	if f.Limit > 500 {
-		f.Limit = 500
-	}
-	if f.Offset < 0 {
-		f.Offset = 0
-	}
+	f.Limit = ClampRunLimit(f.Limit)
+	f.Offset = ClampRunOffset(f.Offset)
 
 	var where []string
 	var args []any

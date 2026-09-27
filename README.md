@@ -154,7 +154,7 @@ CLOUDSYNC_SERVER_PASSWORD=x ./bin/cloudsync -check
 - **必填项**：`server.addr`、`server.username`、`server.password`、`rclone.rc_addr`。
 - **留空即随机**：`server.session_secret` 与 `rclone.rc_pass` 留空时会生成随机值。前者重启后使所有会话失效；后者仅对程序自己拉起的 rcd 有意义。
 - **环境变量不能置空**：空字符串视为"未设置"。
-- **默认不限时**：`scheduler.default_timeout` 的内置值是 `0`，即任务不写 `timeout_seconds` 时不会因超时被中断。理由是超大目录的首次同步常超过一天，被上限砍断等于白跑一轮，比卡住更难接受；"别堆积"由 `scheduler.skip_overlap` 与 cron 兜住，真卡死了还能手动取消。要限制就显式写 `"24h"` 这类值。
+- **默认不限时**：`scheduler.default_timeout` 的内置值是 `0`，即任务不写 `timeout_seconds` 时不会因超时被中断。理由是超大目录的首次同步常超过一天，被上限砍断等于白跑一轮，比卡住更难接受；"别堆积"由"同一任务不重叠"（现已无条件，见下文）与 cron 兜住，真卡死了还能手动取消。要限制就显式写 `"24h"` 这类值。
 - **时区无需宿主支持**：IANA 时区库已通过 `import _ "time/tzdata"` 编入二进制（代价约 450KB）。这是必需的——发布构建用了 `-trimpath`，它会让 `runtime.GOROOT()` 返回空字符串，而 Windows 不读系统时区库，两者叠加会使 `scheduler.timezone: "Asia/Shanghai"` 直接报 `unknown time zone` 导致进程无法启动。精简容器同理。回归防线见 `internal/config/config_test.go` 的 `TestTimezoneDatabaseIsEmbedded`。
 
 ### 命令行参数
@@ -204,7 +204,7 @@ CLOUDSYNC_SERVER_PASSWORD=x ./bin/cloudsync -check
 | `CLOUDSYNC_SCHEDULER_ENABLED` | `scheduler.enabled` |
 | `CLOUDSYNC_SCHEDULER_TIMEZONE` | `scheduler.timezone` |
 | `CLOUDSYNC_SCHEDULER_SECONDS` | `scheduler.seconds` |
-| `CLOUDSYNC_SCHEDULER_SKIP_OVERLAP` | `scheduler.skip_overlap` |
+| `CLOUDSYNC_SCHEDULER_SKIP_OVERLAP` | `scheduler.skip_overlap`（已废弃，不再生效） |
 | `CLOUDSYNC_SCHEDULER_MAX_CONCURRENT_RUNS` | `scheduler.max_concurrent_runs` |
 | `CLOUDSYNC_SCHEDULER_DEFAULT_TIMEOUT` | `scheduler.default_timeout` |
 | `CLOUDSYNC_LOG_LEVEL` | `log.level` |
@@ -241,12 +241,12 @@ CLOUDSYNC_SERVER_PASSWORD=x ./bin/cloudsync -check
 | `PUT` | `/api/tasks/{id}` | 更新任务；任务运行中返回 `409 task_running` |
 | `POST` | `/api/tasks/{id}/enabled` | 只切换启用状态，body 为 `{"enabled": true}`；重复设置幂等 |
 | `DELETE` | `/api/tasks/{id}` | 删除任务；正在运行需加 `?force=1`。会连带清除该任务的历史运行记录——任务编号会被复用，留着旧记录会让新任务凭空多出"上次运行结果" |
-| `POST` | `/api/tasks/{id}/run` | 手动触发，返回 `202` 与运行记录；可选 `?from_step=N` 从第 `N+1` 步开始（`N` 为 0 基下标），见[从失败的那一步重跑](#从失败的那一步重跑) |
+| `POST` | `/api/tasks/{id}/run` | 手动触发，返回 `202` 与运行记录；同一任务已在运行时返回 `409 task_busy`（跳过本次触发）。可选 `?from_step=N` 从第 `N+1` 步开始（`N` 为 0 基下标），见[从失败的那一步重跑](#从失败的那一步重跑) |
 | `POST` | `/api/tasks/{id}/cancel` | 取消该任务当前运行中的实例 |
 
 **运行中锁定**：任务处于运行态时，`PUT` / `DELETE` / `POST /enabled` 一律返回 `409 task_running`，唯一可用的操作是取消——改定义只对下一轮生效，用户却常误以为对当前这轮也生效。`?force=1` 是留给脚本的运维后门（先取消再删除），界面不提供。
 
-另外，**多步骤任务无条件禁止并发**（不看 `scheduler.skip_overlap`）：一条链的时长是各步之和加间隔，很容易超过触发周期，允许重叠会让几轮链同时跑，互相抢带宽，且"最近一次结果"变得不可解释。重叠时再次触发返回 `409 task_busy`。
+另外，**同一任务无条件禁止并发**（手动与定时触发一视同仁，不再受 `scheduler.skip_overlap` 影响）：一条链的时长是各步之和加间隔，很容易超过触发周期，允许重叠会让几轮同时跑，互相抢带宽，且"最近一次结果"变得不可解释。上一轮尚未结束时再次触发（无论手动还是定时）返回 `409 task_busy`，提示"同样的任务正在运行"，并跳过本次触发、不新建运行记录。
 
 ### 运行记录
 
@@ -420,7 +420,7 @@ curl -sS -b $JAR -N $BASE/api/events
 - **进度按步骤数折算，不是按字节比**：各步总量在开始前不可知，中途还会随新步骤开始而增长，用字节比会让百分比往回跳。折算是「已完成步骤数 / 本轮步骤数」加上「当前步骤进度 / 本轮步骤数」，单步骤任务的进度与升级前完全一致；失败的步骤不计入完成数，整链没走通进度就不会到顶。
 - **每个步骤一个 rclone 分组** `run-<runID>-<stepIdx>`：分组混用会让 `core/stats?group=` 读到跨步累计值。字节/文件数等统计仍在运行记录上按整条链累加。
 - **逐步结果可见**：运行记录带 `step_index`（0 基）、`step_total` 与 `step_results`（每步的状态、耗时、字节/文件数、错误），详情页逐步展示是哪一步挂的。
-- **多步骤任务无条件禁止并发**：链的时长是各步之和加间隔，很容易超过触发周期，允许重叠会让几轮链同时跑、互相抢带宽，"最近一次结果"也失去意义。
+- **同一任务无条件禁止并发**：手动与定时触发一视同仁——只要该任务上一轮尚未结束，本次触发就被跳过（返回 `409 task_busy` / 日志提示"同样的任务正在运行"）。链的时长是各步之和加间隔，很容易超过触发周期，允许重叠会让几轮同时跑、互相抢带宽，"最近一次结果"也失去意义。
 
 #### 从失败的那一步重跑
 

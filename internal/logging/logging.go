@@ -209,7 +209,15 @@ func (r *RingBuffer) Mark() int64 {
 func (r *RingBuffer) Since(mark int64) (lines []string, overflow bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	if len(r.lines) > 0 && mark < r.lines[0].seq {
+	// 缓冲区里现存最老的序号；没有任何行时视为"下一条待写"（r.next）。
+	// 用显式的 oldest 而不是 len(r.lines) > 0 判断：Reset 清空后 lines 为空，
+	// 但旧游标指向的行确实已被丢弃，必须如实上报 overflow，否则调用方会以为
+	// 日志片段是完整的。
+	oldest := r.next
+	if len(r.lines) > 0 {
+		oldest = r.lines[0].seq
+	}
+	if mark < oldest {
 		overflow = true
 	}
 	for _, e := range r.lines {

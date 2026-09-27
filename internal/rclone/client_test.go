@@ -470,6 +470,22 @@ func TestBuildArgsNoAuth(t *testing.T) {
 	}
 }
 
+func TestRedactArgsMasksPassword(t *testing.T) {
+	args := []string{"rcd", "--rc-addr", "127.0.0.1:5572", "--rc-user", "u", "--rc-pass", "s3cret", "--rc-serve"}
+	got := redactArgs(args)
+	joined := strings.Join(got, " ")
+	if strings.Contains(joined, "s3cret") {
+		t.Errorf("脱敏后不应出现明文密码: %s", joined)
+	}
+	if !strings.Contains(joined, "--rc-pass ***") {
+		t.Errorf("应保留 --rc-pass 但值替换为 ***: %s", joined)
+	}
+	// 入参不能被改动 —— exec 要拿它去启动进程，必须仍是明文。
+	if args[6] != "s3cret" {
+		t.Errorf("redactArgs 不应改动入参: %v", args)
+	}
+}
+
 func TestClientEndpointNormalization(t *testing.T) {
 	cases := map[string]string{
 		"127.0.0.1:5572":      "http://127.0.0.1:5572",
@@ -510,5 +526,37 @@ func TestRingBufferSinceReportsOverflow(t *testing.T) {
 	_, overflow := buf.Since(mark)
 	if !overflow {
 		t.Error("缓冲区滚动后应报告 overflow")
+	}
+}
+
+// Reset 清空后，即便一条新行都没写，持有旧游标的调用方也必须被告知数据已丢。
+func TestRingBufferSinceReportsOverflowAfterResetWithoutNewLines(t *testing.T) {
+	buf := logging.NewRingBuffer(16)
+	_, _ = buf.Write([]byte("l1\n"))
+	mark := buf.Mark()
+	_, _ = buf.Write([]byte("l2\n"))
+
+	buf.Reset()
+
+	lines, overflow := buf.Since(mark)
+	if len(lines) != 0 {
+		t.Errorf("清空后没有新行，结果应为空: %+v", lines)
+	}
+	if !overflow {
+		t.Error("清空丢弃了游标之前的行，即便没有新行也必须上报 overflow")
+	}
+}
+
+// 游标正好落在"下一条待写"时，Reset 并没有丢掉该游标想要的任何行，不应误报 overflow。
+func TestRingBufferSinceNoFalseOverflowAfterReset(t *testing.T) {
+	buf := logging.NewRingBuffer(16)
+	_, _ = buf.Write([]byte("l1\n"))
+	mark := buf.Mark()
+
+	buf.Reset()
+
+	_, overflow := buf.Since(mark)
+	if overflow {
+		t.Error("游标之后本就没有行，Reset 不应误报 overflow")
 	}
 }

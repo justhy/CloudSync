@@ -253,6 +253,34 @@ func TestLoadWithoutAnyFileUsesDefaults(t *testing.T) {
 	}
 }
 
+// 空文件（或只有注释/空白）是合法配置：Decode 会返回 io.EOF，必须当作
+// "没写任何配置"继续走默认值，而不是报 "解析配置文件 …: EOF" 把启动拦下。
+func TestLoadEmptyOrCommentOnlyConfigUsesDefaults(t *testing.T) {
+	cases := map[string]string{
+		"空文件": "",
+		"仅空白": "\n\n   \n",
+		"仅注释": "# 只是注释\n# 再来一行\n",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "empty.yaml")
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(EnvPrefix+"_CONFIG", "")
+			t.Setenv(EnvPrefix+"_SERVER_PASSWORD", "testpw")
+
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(%q) 失败: %v", path, err)
+			}
+			if want := Default().Server.Addr; cfg.Server.Addr != want {
+				t.Errorf("空配置应回落内置默认值，addr = %q，期望 %q", cfg.Server.Addr, want)
+			}
+		})
+	}
+}
+
 func TestLoadRejectsUnknownField(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bad.yaml")

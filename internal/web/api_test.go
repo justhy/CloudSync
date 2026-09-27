@@ -163,7 +163,6 @@ func newTestEnvWith(t *testing.T, mutate func(*config.Config), mutateRC func(*st
 	mgr := manager.New(st, rc, rclone.NewRunner(cfg.Rclone), sup.Journal(), manager.Options{
 		MaxConcurrent: 2,
 		PollInterval:  15 * time.Millisecond,
-		SkipOverlap:   true,
 	}, logging.Discard())
 	mgr.SetBaseContext(context.Background())
 
@@ -1002,7 +1001,7 @@ func TestTriggerRunAndProgress(t *testing.T) {
 		t.Errorf("触发响应错误: %+v", triggered.Run)
 	}
 
-	// 重复触发应被 SkipOverlap 拒绝（或首个已完成，此时允许再次触发）
+	// 等待首个运行结束（同一任务在跑时再次触发会被 409 task_busy 拒绝）。
 	waitForStatus(t, e.store, triggered.Run.ID, store.StatusSuccess)
 
 	// 详情 + 进度
@@ -1189,6 +1188,72 @@ func TestSettingsEndpoints(t *testing.T) {
 	}
 	if _, err := e.store.GetRun(ctx, old.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("过期记录应被清理，得到 %v", err)
+	}
+}
+
+// 有任务在运行时，prune 之后的磁盘整理必须跳过：VACUUM 要重写整个库，期间所有
+// 进度回写都会被那条唯一的数据库连接堵住，用户看到的是"传输卡住了"。
+func TestPruneSkipsVacuumWhileTaskRunning(t *testing.T) {
+	e := newTestEnvWith(t, nil, func(rc *stubRC) { rc.neverFinish = true })
+	e.login()
+	ctx := context.Background()
+
+	// 保留 1 小时，便于把 3 天前的记录判为过期。
+	if code := e.doJSON("PUT", "/api/settings", map[string]any{"retention_hours": 1}, nil); code != http.StatusOK {
+		t.Fatalf("设置保留策略应 200，得到 %d", code)
+	}
+
+	// 一个永不结束的任务占住运行态。
+	var created struct {
+		Task struct {
+			ID int64 `json:"id"`
+		} `json:"task"`
+	}
+	if code := e.doJSON("POST", "/api/tasks", samplePayload("占用任务"), &created); code != http.StatusCreated {
+		t.Fatalf("创建任务应 201，得到 %d", code)
+	}
+	runningTask, err := e.store.GetTask(ctx, created.Task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.mgr.Trigger(ctx, runningTask, store.TriggerManual); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && e.mgr.ActiveCount() == 0 {
+		time.Sleep(15 * time.Millisecond)
+	}
+	if e.mgr.ActiveCount() == 0 {
+		t.Skip("任务已瞬间完成，无法验证整理跳过")
+	}
+
+	// 另造一条 3 天前的成功记录，保证 prune 确实删了东西（deleted>0 才会尝试整理）。
+	oldTask := &store.Task{Name: "旧记录任务", Kind: store.KindSync, Source: "a:", Dest: "b:", Enabled: true}
+	if err := e.store.CreateTask(ctx, oldTask); err != nil {
+		t.Fatal(err)
+	}
+	old := &store.Run{TaskID: oldTask.ID, TaskName: oldTask.Name, Kind: oldTask.Kind,
+		Status: store.StatusSuccess, StartedAt: time.Now().UTC().Add(-72 * time.Hour)}
+	if err := e.store.CreateRun(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+
+	var pruned struct {
+		Deleted        int64  `json:"deleted"`
+		Vacuumed       bool   `json:"vacuumed"`
+		ReclaimSkipped string `json:"reclaim_skipped"`
+	}
+	if code := e.doJSON("POST", "/api/runs/prune", nil, &pruned); code != http.StatusOK {
+		t.Fatalf("立即清理应 200，得到 %d", code)
+	}
+	if pruned.Deleted != 1 {
+		t.Fatalf("应删掉 1 条过期记录，实际 %d", pruned.Deleted)
+	}
+	if pruned.Vacuumed {
+		t.Fatal("有任务在运行时不应 VACUUM")
+	}
+	if pruned.ReclaimSkipped == "" {
+		t.Fatal("应给出跳过整理的原因")
 	}
 }
 
@@ -1462,6 +1527,49 @@ func TestDeleteRunningTaskWithForce(t *testing.T) {
 	}
 }
 
+// TestManualTriggerRejectedWhileSameTaskRunning：同一任务已在运行时，再次手动触发
+// 必须返回 409 且 code=task_busy，提示语包含"同样的任务正在运行"，并跳过本次触发
+// （不新建运行记录）。这是"手动与定时一视同仁地拦截同一任务重叠"的接口级保证。
+func TestManualTriggerRejectedWhileSameTaskRunning(t *testing.T) {
+	e := newTestEnvWith(t, nil, func(rc *stubRC) { rc.neverFinish = true })
+	e.login()
+	id := createTaskViaAPI(t, e, "重叠触发")
+
+	// 第一次触发：接受，并把任务钉在运行态。
+	var first struct {
+		Run store.Run `json:"run"`
+	}
+	if code := e.doJSON("POST", fmt.Sprintf("/api/tasks/%d/run", id), nil, &first); code != http.StatusAccepted {
+		t.Fatalf("首次触发应 202，得到 %d", code)
+	}
+	waitForStatus(t, e.store, 0, "")
+	if e.mgr.RunningByTask(id) == nil {
+		t.Skip("任务已瞬间完成，无法验证重叠拦截")
+	}
+
+	// 第二次触发：同一任务仍在运行，应被 409 拒绝。
+	var errOut apiError
+	code := e.doJSON("POST", fmt.Sprintf("/api/tasks/%d/run", id), nil, &errOut)
+	if code != http.StatusConflict {
+		t.Fatalf("同一任务重叠触发应 409，得到 %d（%+v）", code, errOut)
+	}
+	if errOut.Code != "task_busy" {
+		t.Errorf("错误码应为 task_busy，得到 %q", errOut.Code)
+	}
+	if !strings.Contains(errOut.Error, "同样的任务正在运行") {
+		t.Errorf("提示语应包含“同样的任务正在运行”，得到 %q", errOut.Error)
+	}
+
+	// 被跳过的触发不应留下运行记录。
+	_, total, err := e.store.ListRuns(context.Background(), store.RunFilter{TaskID: id, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Errorf("被跳过的触发不应新建运行记录，期望 1 条，得到 %d", total)
+	}
+}
+
 // createTaskViaAPI 建一个最小可用任务并返回 ID。
 func createTaskViaAPI(t *testing.T, e *testEnv, name string) int64 {
 	t.Helper()
@@ -1591,5 +1699,44 @@ func TestDatabaseCleanupEndpoint(t *testing.T) {
 	}
 	if settings.DB.TotalBytes <= 0 {
 		t.Fatalf("应统计出数据库总占用，实际 %+v", settings.DB)
+	}
+}
+
+// 未注册的 /api/* 必须返回 JSON 404，而不是回退到 index.html（否则前端会把
+// HTML 当 JSON 解析，报出与真实原因无关的错误）。
+func TestUnknownAPIPathReturnsJSON404(t *testing.T) {
+	e := newTestEnv(t, nil)
+	resp, data := e.do("GET", "/api/does-not-exist", nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("未注册的接口应 404，得到 %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("应返回 JSON，Content-Type = %q", ct)
+	}
+	var body apiError
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatalf("响应不是合法 JSON: %v（原始: %s）", err, data)
+	}
+	if body.Code != "not_found" {
+		t.Errorf("错误码应为 not_found，得到 %q", body.Code)
+	}
+}
+
+// 请求体只允许一个 JSON 对象；后面的多余内容必须被拒绝，避免客户端 bug 被静默吞掉。
+func TestDecodeJSONRejectsTrailingContent(t *testing.T) {
+	var dst struct {
+		A int `json:"a"`
+	}
+	req := httptest.NewRequest("POST", "/x", strings.NewReader(`{"a":1} {"b":2}`))
+	if err := decodeJSON(req, &dst); err == nil {
+		t.Fatal("多余的第二个 JSON 对象应被拒绝")
+	}
+
+	var dst2 struct {
+		A int `json:"a"`
+	}
+	req2 := httptest.NewRequest("POST", "/x", strings.NewReader(`{"a":1}`))
+	if err := decodeJSON(req2, &dst2); err != nil {
+		t.Fatalf("单个 JSON 对象应被接受: %v", err)
 	}
 }
