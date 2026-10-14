@@ -577,8 +577,9 @@ journalctl -u cloudsync -f
 ## 发版
 
 发版走 GitHub Actions（`.github/workflows/release.yml`）：推一个 tag 上去，自动
-「校验 → 交叉编译 → 打包 → 建 Release 草稿」。构建参数只有一份 —— 在 Makefile 的
-`dist` 目标里，CI 只负责编排，不会出现 CI 与本地两套参数悄悄漂移的情况。
+「校验 → 交叉编译 → 打包 → 直接发布 Release」。构建参数只有一份 —— 在 Makefile 里
+（`dist` 与 `cross` 共用同一个 `_compile` 步骤），CI 只负责编排，不会出现 CI 与本地
+两套参数悄悄漂移的情况。
 
 ### 触发方式
 
@@ -603,21 +604,19 @@ git push origin v0.1.0
 
 ### 产物命名
 
-`cloudsync-<版本>-<系统>-<架构>[vN].<tar.gz|zip>`（32 位 ARM 带 `vN` 区分 GOARM）：
+`cloudsync-<版本>-<系统>-<架构>.<tar.gz|zip>`：
 
 | 系统 | 架构 | 归档 |
 | --- | --- | --- |
 | Linux | amd64（64 位 x86） | `cloudsync-v0.1.0-linux-amd64.tar.gz` |
-| Linux | 386（32 位 x86） | `cloudsync-v0.1.0-linux-386.tar.gz` |
-| Linux | armv6（32 位 ARM） | `cloudsync-v0.1.0-linux-armv6.tar.gz` |
-| Linux | armv7（32 位 ARM） | `cloudsync-v0.1.0-linux-armv7.tar.gz` |
 | Linux | arm64（64 位 ARM） | `cloudsync-v0.1.0-linux-arm64.tar.gz` |
-| Linux | riscv64 | `cloudsync-v0.1.0-linux-riscv64.tar.gz` |
 | Windows | amd64（64 位 x86） | `cloudsync-v0.1.0-windows-amd64.zip` |
-| Windows | 386（32 位 x86） | `cloudsync-v0.1.0-windows-386.zip` |
 | Windows | arm64（64 位 ARM） | `cloudsync-v0.1.0-windows-arm64.zip` |
 | macOS | amd64（Intel） | `cloudsync-v0.1.0-darwin-amd64.tar.gz` |
 | macOS | arm64（Apple Silicon） | `cloudsync-v0.1.0-darwin-arm64.tar.gz` |
+
+发版矩阵固定为上面 6 个平台，定义在 Makefile 的 `PLATFORMS` 变量里（单一事实来源）；
+`.github/workflows/release.yml` 直接调 `make dist`，不额外传平台参数。
 
 另附一份 `SHA256SUMS`（只覆盖归档，不含中间产物）：
 
@@ -628,8 +627,9 @@ sha256sum -c SHA256SUMS
 归档内含 `cloudsync`（Unix 平台带可执行位）+ `README.md` + `config.example.yaml`。Unix 平台
 刻意用 `tar.gz` 而不是裸二进制 —— 裸文件从 GitHub 下载后会丢掉可执行位，`tar.gz` 能保留。
 
-32 位 ARM 为什么出两个：`armv6` 能跑在 v6 与 v7 硬件上（兼容性最好），`armv7` 是硬浮点、
-性能更好。两者文件名不歧义，多一个归档而已。
+> 本地 `make cross` 只打 `windows/amd64`（裸二进制，本地自用）；需要别的平台可
+> `make cross LOCAL_PLATFORMS="linux/arm64 darwin/arm64"`。发版归档只由 `make dist`
+> 产出，平台固定为上面 6 个。
 
 #### 为什么没有 MIPS
 
@@ -646,11 +646,11 @@ sha256sum -c SHA256SUMS
 可以再验证一次 MIPS 是否被补上。真需要 MIPS 只能换 CGO 版驱动
 （`mattn/go-sqlite3`），那等于放弃无 CGO 交叉编译、给每个目标配 C 交叉工具链。
 
-### Release 是草稿
+### Release 直接发布
 
-工作流建的是**草稿** Release（`draft: true`），需要人工过一眼产物与自动生成的
-Release notes，再点 Publish。注意：草稿状态下 `GET /releases/latest` 取不到这份
-Release，别误以为发布失败。
+打包完成后工作流**直接发布** Release（`draft: false`），无需人工确认是否发布；Release
+notes 由 `generate_release_notes` 自动生成。推 tag 后稍等片刻，`GET /releases/latest`
+即可取到这份 Release。
 
 ### 本地打包
 
@@ -658,9 +658,10 @@ Release，别误以为发布失败。
 make dist VERSION=v0.1.0    # → dist/*.tar.gz|*.zip 与 SHA256SUMS
 ```
 
-`dist` 依赖 `cross`，所以编译参数只有 `cross` 一份，不存在「本地与 CI 两套参数漂移」。
-跑完之后 `dist/` 里**同时有裸二进制和归档**（前者是 `cross` 的产物）—— 上传 Release 时
-只取归档与 `SHA256SUMS`，workflow 里已按 `*.tar.gz` / `*.zip` 明确限定。
+`dist` 依赖 `_compile`（与 `cross` 共用的编译步骤），所以编译参数只有一份，不存在
+「本地与 CI 两套参数漂移」。跑完之后 `dist/` 里**同时有裸二进制和归档**（前者是
+`_compile` 的产物）—— 上传 Release 时只取归档与 `SHA256SUMS`，workflow 里已按
+`*.tar.gz` / `*.zip` 明确限定。
 
 `make dist` 依赖 `zip` / `tar` / `sha256sum`，所以适合在 Linux/WSL 或 CI 上跑。
 Windows 的 Git Bash 一般不带 `zip`，该目标会**直接报错退出**，而不是产出一份
@@ -692,7 +693,7 @@ make test          # go test ./...
 make vet           # go vet ./...
 make fmt           # gofmt -l -w
 make run           # 本地运行（读取 config.yaml）
-make cross         # 交叉编译 11 个平台到 dist/（裸二进制，本地自用）
+make cross         # 交叉编译本地自用平台（默认 windows/amd64）到 dist/（裸二进制）
 make dist          # cross + 打包归档 + SHA256SUMS（发版用，见「发版」）
 make clean         # 清理 bin/ 与 dist/
 ```

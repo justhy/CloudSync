@@ -1,11 +1,11 @@
 # CloudSync 构建脚本
 #
 # 常用：
-#   make build        构建 bin/cloudsync
+#   make build        构建当前平台的 bin/cloudsync（本地开发用）
 #   make web-build    构建前端产物（改了 web/src 之后要跑）
 #   make test         运行全部测试
-#   make cross        交叉编译多平台（裸二进制，本地自用）
-#   make dist         交叉编译 + 打包归档 + 校验和（发版用，CI 调的就是它）
+#   make cross        交叉编译本地自用平台到 dist/（默认 windows/amd64，裸二进制）
+#   make dist         交叉编译发版 6 平台 + 打包归档 + 校验和（发版用，CI 调的就是它）
 
 SHELL      := /bin/sh
 
@@ -24,32 +24,30 @@ GOFLAGS    ?=
 # -s -w 去掉符号表与调试信息；-X 注入版本号。
 LDFLAGS    := -s -w -X main.version=$(VERSION)
 
-# 交叉编译目标。格式：os/arch，第三段可选 —— 只有 32 位 ARM 需要它，即 GOARM。
-#   linux/arm/6 → GOARM=6（armv6，能跑在 v6 与 v7 硬件上，兼容性最好）
-#   linux/arm/7 → GOARM=7（armv7 硬浮点，性能更好，现代 32 位 ARM 用户态的主流）
-# Go 对 GOARCH=arm 的默认 GOARM 是 7，这里两个都出，文件名不歧义。
+# 发版平台（6 个）：windows / linux / macOS × amd64 / arm64。
+# make dist 与 CI（.github/workflows/release.yml）共用这一份 —— 单一事实来源，
+# 两边不会悄悄漂移。
 #
-# **MIPS 全家出不了二进制**，不要再往下面的清单里加 mips/mipsle/mips64/mips64le：
-# modernc.org/sqlite（纯 Go SQLite 驱动，也是本项目 CGO_ENABLED=0 交叉编译的前提）
-# 依赖 modernc.org/libc，而 libc 没有 MIPS 实现 ——
-#   - mips / mipsle / mips64：errno 等包 "build constraints exclude all Go files"，
-#     即该架构下 libc 一个文件都没有；
-#   - mips64le：libc 有半套，但 sqlite 侧的绑定缺失，报一堆
-#     "undefined: sqlite3_index_constraint / Xsqlite3_config / SQLITE_OK"。
-# 真需要 MIPS 只能换成 CGO 版驱动（mattn/go-sqlite3），那等于放弃无 CGO 交叉编译，
-# 要为每个目标配 C 交叉工具链 —— 代价远大于收益，不建议。
-PLATFORMS  := \
-	linux/amd64 \
-	linux/386 \
-	linux/arm/6 \
-	linux/arm/7 \
-	linux/arm64 \
-	linux/riscv64 \
+# 格式：os/arch，第三段可选 —— 只有 32 位 ARM 才需要它（GOARM，如 linux/arm/7）。
+# 当前清单没有 32 位 ARM，但保留该支持，方便临时加平台。
+#
+# **MIPS 全家出不了二进制**，不要再往清单里加 mips/mipsle/mips64/mips64le：
+# modernc.org/sqlite（纯 Go 驱动，也是本项目 CGO_ENABLED=0 交叉编译的前提）依赖的
+# modernc.org/libc 没有 MIPS 实现，会报 "build constraints exclude all Go files"
+# 或一堆 undefined: sqlite3_index_constraint / Xsqlite3_config / SQLITE_OK。
+# 真需要 MIPS 只能换 CGO 版驱动（mattn/go-sqlite3），那等于放弃无 CGO 交叉编译、
+# 给每个目标配 C 交叉工具链 —— 代价远大于收益，不建议。
+PLATFORMS := \
 	windows/amd64 \
-	windows/386 \
 	windows/arm64 \
+	linux/amd64 \
+	linux/arm64 \
 	darwin/amd64 \
 	darwin/arm64
+
+# 本地交叉编译（make cross）默认只针对当前开发机：Windows amd64。
+# 想本地临时多打几个平台：make cross LOCAL_PLATFORMS="linux/arm64 darwin/arm64"
+LOCAL_PLATFORMS ?= windows/amd64
 
 .DEFAULT_GOAL := help
 
@@ -63,8 +61,10 @@ build: ## 构建当前平台的 cloudsync
 	$(GO) build $(GOFLAGS) -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(APP) $(PKG_MAIN)
 	@echo "已构建 $(BIN_DIR)/$(APP) ($(VERSION))"
 
-.PHONY: cross
-cross: ## 交叉编译全部平台到 dist/（裸二进制，不打包）
+# 编译裸二进制到 dist/。平台清单由调用方决定：cross 传 LOCAL_PLATFORMS（本地自用），
+# dist 传 PLATFORMS（发版 6 平台）。**编译参数只此一份**，两者不可能漂移。
+.PHONY: _compile
+_compile:
 	@mkdir -p $(DIST_DIR)
 	@set -e; for p in $(PLATFORMS); do \
 		os=$${p%%/*}; rest=$${p#*/}; arch=$${rest%%/*}; variant=""; \
@@ -79,21 +79,25 @@ cross: ## 交叉编译全部平台到 dist/（裸二进制，不打包）
 			$(GO) build $(GOFLAGS) -trimpath -ldflags "$(LDFLAGS)" -o "$$out" $(PKG_MAIN); \
 		chmod 0755 "$$out"; \
 	done
+
+.PHONY: cross
+cross: PLATFORMS := $(LOCAL_PLATFORMS)
+cross: _compile ## 交叉编译本地自用平台到 dist/（默认 windows/amd64，裸二进制，不打包）
 	@echo "交叉编译完成，产物在 $(DIST_DIR)/"
 
-# 发版打包：dist 依赖 cross —— **编译参数只有 cross 一份**，这里只做打包，
+# 发版打包：dist 依赖 _compile —— **编译参数只有 _compile 一份**，这里只做打包，
 # 所以不可能出现「CI 与本地两套 go build 参数悄悄漂移」。
 #
 # 归档命名：cloudsync-<版本>-<系统>-<架构>[vN].<tar.gz|zip>
 #   cloudsync-v0.1.0-linux-amd64.tar.gz
-#   cloudsync-v0.1.0-linux-armv7.tar.gz     <- 32 位 ARM 带 vN 后缀
+#   cloudsync-v0.1.0-linux-armv7.tar.gz     <- 32 位 ARM 带 vN 后缀（当前发版无此平台）
 #   cloudsync-v0.1.0-windows-amd64.zip
 # 归档内含：cloudsync（可执行文件，Unix 平台带可执行位）+ README.md + config.example.yaml。
 #
 # 为什么 Unix 用 tar.gz 而不是直接丢裸二进制：裸文件从 GitHub 下载后会丢掉可执行位，
 # 用户还得自己 chmod +x；tar.gz 能保留。Windows 用 zip，双击就能解压。
 #
-# 注意 dist/ 里同时有 cross 产出的**裸二进制**和这里的**归档**，所以下面算校验和时
+# 注意 dist/ 里同时有 _compile 产出的**裸二进制**和这里的**归档**，所以下面算校验和时
 # 只 glob *.tar.gz *.zip —— 写成 * 会把裸二进制也算进去。CI 上传 Release 同理只取
 # 归档与 SHA256SUMS，见 .github/workflows/release.yml。
 #
@@ -101,7 +105,7 @@ cross: ## 交叉编译全部平台到 dist/（裸二进制，不打包）
 # Windows 的 Git Bash 通常没有 zip，会在此处直接报错退出，而不是产出一份残缺的
 # dist —— 本地要打包请用 WSL/Linux，或走 workflow_dispatch 试跑。
 .PHONY: dist
-dist: cross ## 交叉编译并打包发版归档（产出 dist/*.tar.gz|*.zip 与 SHA256SUMS）
+dist: _compile ## 交叉编译发版 6 平台并打包归档（产出 dist/*.tar.gz|*.zip 与 SHA256SUMS）
 	@command -v zip >/dev/null 2>&1 || { \
 		echo "缺少 zip 命令：Windows 的 Git Bash 一般不带 zip。"; \
 		echo "请在 Linux/WSL 或 CI 上执行 make dist，或安装 zip 后重试。"; \

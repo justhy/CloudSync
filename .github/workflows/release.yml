@@ -1,8 +1,13 @@
-# 打包与发布：打 v* tag 即自动跑「校验 → 交叉编译 → 归档 → 建 Release 草稿」。
+# 打包与发布：打 v* tag 即自动跑「校验 → 交叉编译 → 归档 → 直接发布 Release」。
 #
 # 触发方式：
 #   正式发版：git tag -a v0.1.0 -m "v0.1.0" && git push origin v0.1.0
+#             → 校验、打包、发布 Release 全自动完成，无需人工点 Publish。
 #   仅试跑：  Actions 页面点 Run workflow —— 只产出 artifact，不建 Release
+#
+# 发版平台（6 个）：windows/amd64、windows/arm64、linux/amd64、linux/arm64、
+# darwin/amd64、darwin/arm64。矩阵定义在 Makefile 的 PLATFORMS 里（单一事实来源），
+# CI 直接调 make dist，不额外传平台参数。
 #
 # 两个前提（不满足会"什么都没发生"，而且没有任何报错，极难排查）：
 #   1. 本文件必须已经存在于默认分支，tag 事件与手动触发才能看到它；
@@ -76,7 +81,8 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "打包版本：$v"
 
-      # 一条命令产出全部平台的归档与 SHA256SUMS，本地跑 make dist 结果一致。
+      # 一条命令产出全部平台的归档与 SHA256SUMS；平台清单由 Makefile 的 PLATFORMS
+      # 决定（单一事实来源），本地跑 make dist 结果一致。
       - name: make dist
         run: make dist VERSION="${{ steps.ver.outputs.version }}"
 
@@ -112,7 +118,6 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/SHA256SUMS
-          # 先出草稿，人工过一眼产物与 Release notes 再点 Publish。
-          # 注意：草稿状态下 /releases/latest 取不到，别以为发布失败了。
-          draft: true
+          # 打包完成后直接发布，不再出草稿、无需人工点 Publish。
+          draft: false
           generate_release_notes: true
