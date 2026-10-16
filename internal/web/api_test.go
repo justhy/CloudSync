@@ -268,7 +268,7 @@ func TestHealthNeedsNoAuth(t *testing.T) {
 
 func TestProtectedEndpointsRequireAuth(t *testing.T) {
 	e := newTestEnv(t, nil)
-	for _, path := range []string{"/api/overview", "/api/tasks", "/api/runs", "/api/rclone"} {
+	for _, path := range []string{"/api/overview", "/api/tasks", "/api/tasks/export", "/api/runs", "/api/rclone"} {
 		resp, _ := e.do("GET", path, nil)
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Errorf("%s 未认证时应返回 401，得到 %d", path, resp.StatusCode)
@@ -1738,5 +1738,234 @@ func TestDecodeJSONRejectsTrailingContent(t *testing.T) {
 	req2 := httptest.NewRequest("POST", "/x", strings.NewReader(`{"a":1}`))
 	if err := decodeJSON(req2, &dst2); err != nil {
 		t.Fatalf("单个 JSON 对象应被接受: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 任务导出 / 导入（数据迁移）
+// ---------------------------------------------------------------------------
+
+// 导出 → 清空 → 再导入：任务定义（含多步骤结构）应完整往返。
+func TestTaskExportImportRoundTrip(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.login()
+
+	multi := map[string]any{
+		"name": "多步骤备份",
+		"steps": []map[string]any{
+			{"name": "拉取", "kind": "copy", "source": "gdrive:a", "dest": "/data/a", "on_error": "abort"},
+			{"name": "校验", "kind": "check", "source": "/data/a", "dest": "gdrive:b", "delay_after": 5},
+		},
+		"cron_expr": "0 0 3 * * *",
+		"enabled":   true,
+	}
+	if code := e.doJSON("POST", "/api/tasks", multi, nil); code != http.StatusCreated {
+		t.Fatalf("创建多步骤任务失败: %d", code)
+	}
+	if code := e.doJSON("POST", "/api/tasks", samplePayload("普通任务"), nil); code != http.StatusCreated {
+		t.Fatalf("创建任务失败: %d", code)
+	}
+
+	resp, raw := e.do("GET", "/api/tasks/export", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("导出应返回 200，得到 %d", resp.StatusCode)
+	}
+	if cd := resp.Header.Get("Content-Disposition"); !strings.Contains(cd, "attachment") {
+		t.Errorf("导出应带 Content-Disposition attachment，得到 %q", cd)
+	}
+	var doc taskExportDoc
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("解析导出文档失败: %v", err)
+	}
+	if doc.Format != taskExportFormat || doc.Count != 2 || len(doc.Tasks) != 2 {
+		t.Fatalf("导出文档结构不对: format=%q count=%d tasks=%d", doc.Format, doc.Count, len(doc.Tasks))
+	}
+
+	var exported *taskPayload
+	for i := range doc.Tasks {
+		if doc.Tasks[i].Name == "多步骤备份" {
+			exported = &doc.Tasks[i]
+		}
+	}
+	if exported == nil || len(exported.Steps) != 2 {
+		t.Fatalf("多步骤任务未正确导出: %+v", exported)
+	}
+	if exported.Steps[0].OnError != string(store.OnErrorAbort) || exported.Steps[1].DelayAfter != 5 {
+		t.Errorf("步骤字段未正确导出: %+v", exported.Steps)
+	}
+
+	// 同库原样再导入：两个同名任务都应被跳过（幂等）。
+	var res taskImportResult
+	if code := e.doJSON("POST", "/api/tasks/import", doc, &res); code != http.StatusOK {
+		t.Fatalf("导入应返回 200，得到 %d", code)
+	}
+	if res.Created != 0 || res.Skipped != 2 || res.Failed != 0 {
+		t.Fatalf("同库重复导入应全部跳过: %+v", res)
+	}
+
+	// 清空后重新导入，应新建两个任务且步骤结构保留。
+	tasks, err := e.store.ListTasks(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tk := range tasks {
+		if code := e.doJSON("DELETE", fmt.Sprintf("/api/tasks/%d", tk.ID), nil, nil); code != http.StatusOK {
+			t.Fatalf("删除任务 #%d 失败: %d", tk.ID, code)
+		}
+	}
+	res = taskImportResult{}
+	if code := e.doJSON("POST", "/api/tasks/import", doc, &res); code != http.StatusOK {
+		t.Fatalf("导入应返回 200，得到 %d", code)
+	}
+	if res.Created != 2 || res.Skipped != 0 || res.Failed != 0 {
+		t.Fatalf("清空后导入应新建 2 个任务: %+v", res)
+	}
+	got, err := e.store.GetTaskByName(context.Background(), "多步骤备份")
+	if err != nil {
+		t.Fatalf("导入后应能按名查到任务: %v", err)
+	}
+	if len(got.Steps) != 2 || got.Steps[0].OnError != store.OnErrorAbort || got.Steps[1].DelayAfter != 5 {
+		t.Errorf("导入后步骤未保留: %+v", got.Steps)
+	}
+}
+
+// 导入时：同名任务跳过、非法任务记为失败、合法新任务正常创建。
+func TestTaskImportSkipsAndReportsFailures(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.login()
+
+	if code := e.doJSON("POST", "/api/tasks", samplePayload("已存在"), nil); code != http.StatusCreated {
+		t.Fatalf("预置任务失败: %d", code)
+	}
+
+	doc := taskExportDoc{
+		Format:  taskExportFormat,
+		Version: 1,
+		Tasks: []taskPayload{
+			{Name: "已存在", Kind: "sync", Source: "a:b", Dest: "c:d"},
+			{Name: "新任务", Kind: "copy", Source: "a:b", Dest: "c:d"},
+			{Name: "", Kind: "sync", Source: "a:b", Dest: "c:d"}, // 名称缺失 → 失败
+		},
+	}
+	var res taskImportResult
+	if code := e.doJSON("POST", "/api/tasks/import", doc, &res); code != http.StatusOK {
+		t.Fatalf("导入应返回 200，得到 %d", code)
+	}
+	if res.Total != 3 || res.Created != 1 || res.Skipped != 1 || res.Failed != 1 {
+		t.Fatalf("导入统计不符: %+v", res)
+	}
+	if _, err := e.store.GetTaskByName(context.Background(), "新任务"); err != nil {
+		t.Errorf("新任务应已导入: %v", err)
+	}
+	if _, err := e.store.GetTaskByName(context.Background(), ""); err == nil {
+		t.Error("空名任务不应被创建")
+	}
+}
+
+// 空任务列表与未知 format 应被拒绝。
+func TestTaskImportRejectsBadInput(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.login()
+
+	if code := e.doJSON("POST", "/api/tasks/import", taskExportDoc{Format: taskExportFormat}, nil); code != http.StatusBadRequest {
+		t.Errorf("空任务列表应返回 400，得到 %d", code)
+	}
+	bad := taskExportDoc{
+		Format: "something-else",
+		Tasks:  []taskPayload{{Name: "x", Kind: "sync", Source: "a:b", Dest: "c:d"}},
+	}
+	if code := e.doJSON("POST", "/api/tasks/import", bad, nil); code != http.StatusBadRequest {
+		t.Errorf("未知 format 应返回 400，得到 %d", code)
+	}
+}
+
+// 覆盖导入：删除现有全部任务，再导入文件里的。
+func TestTaskImportReplaceMode(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.login()
+
+	for _, name := range []string{"旧任务A", "旧任务B"} {
+		if code := e.doJSON("POST", "/api/tasks", samplePayload(name), nil); code != http.StatusCreated {
+			t.Fatalf("预置 %s 失败: %d", name, code)
+		}
+	}
+
+	doc := taskImportRequest{
+		taskExportDoc: taskExportDoc{
+			Format:  taskExportFormat,
+			Version: 1,
+			Tasks:   []taskPayload{{Name: "新任务", Kind: "copy", Source: "a:b", Dest: "c:d"}},
+		},
+		Mode: importModeReplace,
+	}
+	var res taskImportResult
+	if code := e.doJSON("POST", "/api/tasks/import", doc, &res); code != http.StatusOK {
+		t.Fatalf("覆盖导入应 200，得到 %d", code)
+	}
+	if res.Mode != importModeReplace || res.Removed != 2 || res.Created != 1 || res.Skipped != 0 || res.Failed != 0 {
+		t.Fatalf("覆盖导入统计不符: %+v", res)
+	}
+	tasks, err := e.store.ListTasks(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tasks) != 1 || tasks[0].Name != "新任务" {
+		t.Fatalf("覆盖后应只剩新任务，得到 %+v", tasks)
+	}
+}
+
+// 有任务正在运行时，覆盖导入必须整体拒绝，不能悄悄取消正在跑的同步。
+func TestTaskImportReplaceRejectsRunningTask(t *testing.T) {
+	e := newTestEnvWith(t, nil, func(rc *stubRC) { rc.neverFinish = true })
+	e.login()
+
+	var created struct {
+		Task struct {
+			ID int64 `json:"id"`
+		} `json:"task"`
+	}
+	if code := e.doJSON("POST", "/api/tasks", samplePayload("运行中"), &created); code != http.StatusCreated {
+		t.Fatalf("创建任务应 201，得到 %d", code)
+	}
+	if code := e.doJSON("POST", fmt.Sprintf("/api/tasks/%d/run", created.Task.ID), nil, nil); code != http.StatusAccepted {
+		t.Fatalf("触发任务应 202，得到 %d", code)
+	}
+
+	doc := taskImportRequest{
+		taskExportDoc: taskExportDoc{
+			Format: taskExportFormat,
+			Tasks:  []taskPayload{{Name: "新任务", Kind: "sync", Source: "a:b", Dest: "c:d"}},
+		},
+		Mode: importModeReplace,
+	}
+	var errOut apiError
+	if code := e.doJSON("POST", "/api/tasks/import", doc, &errOut); code != http.StatusConflict {
+		t.Fatalf("有任务运行时的覆盖导入应 409，得到 %d（%+v）", code, errOut)
+	}
+	if errOut.Code != "task_running" {
+		t.Errorf("错误码应为 task_running，得到 %q", errOut.Code)
+	}
+	if _, err := e.store.GetTaskByName(context.Background(), "运行中"); err != nil {
+		t.Errorf("拒绝覆盖后原任务应仍在: %v", err)
+	}
+	if _, err := e.store.GetTaskByName(context.Background(), "新任务"); err == nil {
+		t.Error("拒绝覆盖时不应导入任何任务")
+	}
+}
+
+// 未知的导入模式应被拒绝。
+func TestTaskImportRejectsBadMode(t *testing.T) {
+	e := newTestEnv(t, nil)
+	e.login()
+
+	doc := taskImportRequest{
+		taskExportDoc: taskExportDoc{
+			Format: taskExportFormat,
+			Tasks:  []taskPayload{{Name: "x", Kind: "sync", Source: "a:b", Dest: "c:d"}},
+		},
+		Mode: "bogus",
+	}
+	if code := e.doJSON("POST", "/api/tasks/import", doc, nil); code != http.StatusBadRequest {
+		t.Errorf("未知 mode 应返回 400，得到 %d", code)
 	}
 }

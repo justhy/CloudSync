@@ -7,6 +7,9 @@ import type {
   RunStatus,
   SettingsInfo,
   Task,
+  TaskExportDoc,
+  TaskImportRequest,
+  TaskImportResult,
   TaskPayload,
   TaskView,
 } from "./types"
@@ -101,6 +104,12 @@ export const api = {
       "api/tasks/validate",
       { method: "POST", body: { cron_expr, count } },
     ),
+
+  /** 导出全部任务定义为可再导入的 JSON 文档。 */
+  exportTasks: () => request<TaskExportDoc>("api/tasks/export"),
+  /** 从导出文档导入任务；mode 决定覆盖还是追加，逐项返回结果。 */
+  importTasks: (req: TaskImportRequest) =>
+    request<TaskImportResult>("api/tasks/import", { method: "POST", body: req }),
 
   runs: (params: { limit: number; offset: number; status?: string }) => {
     const q = new URLSearchParams({ limit: String(params.limit), offset: String(params.offset) })

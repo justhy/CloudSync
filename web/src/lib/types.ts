@@ -207,6 +207,50 @@ export interface TaskPayload {
   extra_flags: Record<string, unknown>
 }
 
+/**
+ * 任务导出文件。
+ *
+ * tasks 里每一项与创建任务的请求体（TaskPayload）同构，因此导出的文件可以
+ * 原样再导入。
+ */
+export interface TaskExportDoc {
+  format: string
+  version: number
+  exported_at: string
+  count: number
+  tasks: TaskPayload[]
+}
+
+/** 单个任务的导入结果。 */
+export interface TaskImportItem {
+  name: string
+  status: "created" | "skipped" | "failed"
+  id?: number
+  error?: string
+}
+
+/** 导入模式：append 追加（保留现有任务）；replace 覆盖（先删除现有全部任务）。 */
+export type TaskImportMode = "append" | "replace"
+
+/** 导入请求体：导出文档 + 导入模式（缺省为 append）。 */
+export interface TaskImportRequest extends TaskExportDoc {
+  mode?: TaskImportMode
+}
+
+/** 导入接口的汇总响应。 */
+export interface TaskImportResult {
+  mode: TaskImportMode
+  total: number
+  created: number
+  skipped: number
+  failed: number
+  /** replace 模式下被删除的现有任务数。 */
+  removed: number
+  /** 非空表示有任务已导入但定时注册失败。 */
+  warn?: string
+  items: TaskImportItem[]
+}
+
 /** 数据库占用构成（设置页的「数据库瘦身」面板）。 */
 export interface DBStats {
   main_bytes: number

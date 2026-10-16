@@ -120,6 +120,10 @@ func (s *Server) routes() http.Handler {
 
 	mux.Handle("GET /api/tasks", s.requireAuth(s.handleListTasks))
 	mux.Handle("POST /api/tasks", s.requireAuth(s.handleCreateTask))
+	// 迁移用：导出全部任务定义 / 从导出文件导入。字面量路径比 /api/tasks/{id} 更具体，
+	// 因此不会被 {id} 通配吞掉。
+	mux.Handle("GET /api/tasks/export", s.requireAuth(s.handleExportTasks))
+	mux.Handle("POST /api/tasks/import", s.requireAuth(s.handleImportTasks))
 	mux.Handle("POST /api/tasks/validate", s.requireAuth(s.handleValidateCron))
 	mux.Handle("GET /api/tasks/{id}", s.requireAuth(s.handleGetTask))
 	mux.Handle("PUT /api/tasks/{id}", s.requireAuth(s.handleUpdateTask))

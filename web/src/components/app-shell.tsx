@@ -145,7 +145,10 @@ export function AppShell({
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex min-h-svh bg-background">
-        <aside className="hidden w-60 shrink-0 lg:block">{sidebar}</aside>
+        {/* 桌面端：粘在视口顶部、高度锁定为视口高，底部操作区才不会随内容被顶下去。 */}
+        <aside className="hidden w-60 shrink-0 lg:sticky lg:top-0 lg:block lg:h-svh">
+          {sidebar}
+        </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
           <header className="sticky top-0 z-30 flex h-14 items-center gap-2 border-b bg-background/80 px-3 backdrop-blur lg:px-6">

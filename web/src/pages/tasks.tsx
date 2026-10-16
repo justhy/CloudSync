@@ -1,10 +1,18 @@
 import * as React from "react"
-import { Pencil, Play, Plus, Trash2, X } from "lucide-react"
+import { Download, Pencil, Play, Plus, Trash2, Upload, X } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import {
   Table,
   TableBody,
@@ -22,7 +30,7 @@ import { useAutoPoll } from "@/hooks/use-poll"
 import { api } from "@/lib/api"
 import { KIND_TEXT, fmtTime, fromNow } from "@/lib/format"
 import { useSession } from "@/state/session"
-import type { TaskView } from "@/lib/types"
+import type { TaskExportDoc, TaskImportMode, TaskView } from "@/lib/types"
 
 export function TasksPage() {
   const { activeCount, eventTick, refresh } = useSession()
@@ -31,6 +39,10 @@ export function TasksPage() {
   const [loading, setLoading] = React.useState(true)
   const [editing, setEditing] = React.useState<TaskView | null>(null)
   const [formOpen, setFormOpen] = React.useState(false)
+  const fileRef = React.useRef<HTMLInputElement>(null)
+  // 待导入的文档 + 是否正在询问导入方式（目标已有任务时才问）。
+  const [pendingDoc, setPendingDoc] = React.useState<TaskExportDoc | null>(null)
+  const [askOpen, setAskOpen] = React.useState(false)
 
   const load = React.useCallback(async () => {
     try {
@@ -124,6 +136,86 @@ export function TasksPage() {
     }
   }
 
+  /** 导出全部任务定义为 JSON 文件（内容与创建任务的请求体同构，可再导入）。 */
+  async function exportTasks() {
+    try {
+      const doc = await api.exportTasks()
+      const blob = new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.href = url
+      a.download = `cloudsync-tasks-${stamp()}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+      toast.success(`已导出 ${doc.tasks?.length ?? 0} 个任务`)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "导出失败")
+    }
+  }
+
+  /** 读取本地 JSON 文件；目标已有任务时先问「覆盖还是追加」，否则直接追加。 */
+  async function pickImportFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    // 先清空 value，否则连续选择同一个文件不会再触发 change。
+    e.target.value = ""
+    if (!file) return
+
+    let doc: TaskExportDoc
+    try {
+      doc = JSON.parse(await file.text()) as TaskExportDoc
+    } catch {
+      toast.error("文件不是合法的 JSON")
+      return
+    }
+    if (!Array.isArray(doc.tasks) || doc.tasks.length === 0) {
+      toast.error("文件里没有任务")
+      return
+    }
+    // 目标已有任务：让用户决定是覆盖还是追加，不做默默破坏的操作。
+    if (items.length > 0) {
+      setPendingDoc(doc)
+      setAskOpen(true)
+      return
+    }
+    await runImport(doc, "append")
+  }
+
+  /** 按指定模式执行导入并提示结果。 */
+  async function runImport(doc: TaskExportDoc, mode: TaskImportMode) {
+    try {
+      const res = await api.importTasks({ ...doc, mode })
+      const summary =
+        res.mode === "replace"
+          ? `覆盖导入完成：删除 ${res.removed}，新增 ${res.created}，失败 ${res.failed}`
+          : `追加导入完成：新增 ${res.created}，跳过 ${res.skipped}，失败 ${res.failed}`
+      if (res.failed > 0) {
+        const detail = res.items
+          .filter((i) => i.status === "failed")
+          .slice(0, 3)
+          .map((i) => `${i.name || "(未命名)"}：${i.error}`)
+          .join("\n")
+        toast.error(summary, { description: detail })
+      } else if (res.skipped > 0 || (res.mode === "replace" && res.removed > 0)) {
+        toast.warning(summary)
+      } else {
+        toast.success(summary)
+      }
+      if (res.warn) toast.warning(res.warn)
+      await load()
+      refresh()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "导入失败")
+    }
+  }
+
+  /** 在询问弹窗里选定模式后执行导入。 */
+  function chooseImportMode(mode: TaskImportMode) {
+    const doc = pendingDoc
+    setAskOpen(false)
+    setPendingDoc(null)
+    if (doc) void runImport(doc, mode)
+  }
+
   return (
     <TooltipProvider delayDuration={300}>
       <Card>
@@ -132,9 +224,17 @@ export function TasksPage() {
             <CardTitle className="text-base">同步任务</CardTitle>
             <CardDescription>按任务 ID 排序；删除后编号会被复用</CardDescription>
           </div>
-          <Button onClick={openCreate}>
-            <Plus /> 新建任务
-          </Button>
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Button variant="outline" onClick={exportTasks}>
+              <Upload /> 导出任务
+            </Button>
+            <Button variant="outline" onClick={() => fileRef.current?.click()}>
+              <Download /> 导入任务
+            </Button>
+            <Button onClick={openCreate}>
+              <Plus /> 新建任务
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="px-0 pb-0">
           {!loading && items.length === 0 ? (
@@ -147,7 +247,8 @@ export function TasksPage() {
                 <TableHeader>
                   <TableRow>
                     <TableHead className="w-14">ID</TableHead>
-                    <TableHead>名称</TableHead>
+                    {/* 名称列给个下限，否则会被「源 → 目标」挤到一字一行；允许换行显示。 */}
+                    <TableHead className="min-w-[10rem]">名称</TableHead>
                     <TableHead className="w-24">类型</TableHead>
                     <TableHead>源 → 目标</TableHead>
                     <TableHead className="w-32">定时</TableHead>
@@ -314,6 +415,64 @@ export function TasksPage() {
         </CardContent>
       </Card>
 
+      {/* 隐藏的文件选择器：由「导入任务」按钮触发 */}
+      <input
+        ref={fileRef}
+        type="file"
+        accept="application/json,.json"
+        className="hidden"
+        onChange={pickImportFile}
+      />
+
+      {/* 目标已有任务时，先问清楚是覆盖还是追加 */}
+      <Dialog
+        open={askOpen}
+        onOpenChange={(next) => {
+          setAskOpen(next)
+          if (!next) setPendingDoc(null)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>选择导入方式</DialogTitle>
+            <DialogDescription>
+              当前已有 {items.length} 个任务。两种方式结果差别很大，请确认：
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2 text-sm">
+            <div className="rounded-md border p-3">
+              <div className="font-medium">追加</div>
+              <div className="text-muted-foreground">
+                保留现有任务，只新增文件里的；遇到同名任务跳过。
+              </div>
+            </div>
+            <div className="rounded-md border border-destructive/40 p-3">
+              <div className="font-medium text-destructive">覆盖</div>
+              <div className="text-muted-foreground">
+                删除现有全部 {items.length} 个任务（含其运行记录），再导入文件里的任务。
+              </div>
+            </div>
+          </div>
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setAskOpen(false)
+                setPendingDoc(null)
+              }}
+            >
+              取消
+            </Button>
+            <Button variant="secondary" onClick={() => chooseImportMode("append")}>
+              追加导入
+            </Button>
+            <Button variant="destructive" onClick={() => chooseImportMode("replace")}>
+              覆盖导入
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <TaskFormDialog
         open={formOpen}
         task={editing}
@@ -325,6 +484,15 @@ export function TasksPage() {
       />
     </TooltipProvider>
   )
+}
+
+/** 导出文件名用的本地时间戳：YYYYMMDD-HHMMSS。 */
+function stamp() {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(
+    d.getMinutes(),
+  )}${p(d.getSeconds())}`
 }
 
 /** 运行中置灰的按钮：保留 tooltip 说明为什么不能点（disabled 按钮不触发 hover 事件）。 */
